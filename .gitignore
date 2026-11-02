@@ -1,0 +1,23 @@
+# Secrets / local config
+.env
+appsettings.Development.json
+*.local.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# .NET
+bin/
+obj/
+*.user
+.vs/
+
+# Editors / OS
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
