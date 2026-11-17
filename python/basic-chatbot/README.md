@@ -7,6 +7,7 @@
 - **Step 3:** a **web chat UI on App Service** calls the agent with its **managed identity**, and both the app and Foundry send traces to **Application Insights**.
 - **Step 3b:** **Entra ID sign-in** (App Service built-in authentication, no client secret: a federated credential on a user-assigned managed identity). Only assigned users can sign in, and each conversation can only be resumed by the user who started it.
 - **Step 4:** **standard agent setup**. A new project (`proj-chatbot-std`) stores agent definitions and conversations in **our own Cosmos DB**, files in **our own Storage account**, and vector stores in our AI Search service. The old basic project (`proj-chatbot`, agents v1–v4) is kept for comparison.
+- **Step 4b:** **"Your chats" sidebar**. The app keeps its *own* index of each user's conversations (title, timestamps) in a **separate** serverless Cosmos account, partitioned by user. Reopening a chat loads its messages through Foundry's API.
 
 Why it's built this way, and what we observed: [STACK.md](STACK.md).
 
@@ -34,6 +35,7 @@ Defined in [`infra/main.bicep`](infra/main.bicep), region Sweden Central:
 | **Cosmos DB for NoSQL, serverless**, keyless (`enterprise_memory` database is created by Foundry) | 4 | per request, ~$0 idle |
 | **Storage account** (Standard_LRS, no shared keys) for agent files | 4 | per GB, ~$0 |
 | Project connections `cosmos`, `agent-storage`, `search-std`, `appinsights-std` | 4 | none |
+| **App Cosmos DB** `cosmos-chatbot-app-…` (serverless): database `chat`, container `sessions` partitioned by `/user_oid` | 4b | per request, ~$0 idle |
 
 Role assignments (all keyless):
 
@@ -52,6 +54,7 @@ Role assignments (all keyless):
 | Standard project identity | Storage Blob Data Contributor + Blob Data Owner **limited by an ABAC condition to containers named after this project** | Storage | agent files |
 | Standard project identity | Search Index Data Contributor + Search Service Contributor | Search | vector store + the AI Search tool |
 | You | Cosmos DB Built-in Data Reader | `enterprise_memory` | `inspect_cosmos.py`: look at your own conversation data |
+| Web app identity, you | Cosmos DB Built-in Data Contributor | app Cosmos, database `chat` | read/write the sessions list (you: for running the app locally) |
 
 ## Deploy
 
@@ -130,6 +133,7 @@ In the web UI each answer shows its searches, citations, agent version and token
 | [`chat.py`](chat.py) | Terminal client (steps 1–2) | hop 2 → 3, 4, 6, 7 |
 | [`evaluate.py`](evaluate.py) | Fixed question set: searched / correct / tokens / latency per version | evaluation |
 | [`app/main.py`](app/main.py) | FastAPI chat API: managed identity, OpenTelemetry | App Service (1→2) |
+| [`app/sessions.py`](app/sessions.py) | The app's own sessions index (Cosmos, partitioned by user) | app data |
 | [`app/static/index.html`](app/static/index.html) | Chat page. Holds the conversation ID in `sessionStorage`. | user |
 | [`deploy_app.sh`](deploy_app.sh) | Zip deploy; App Service runs `pip install` | build/deploy |
 | [`inspect_cosmos.py`](inspect_cosmos.py) | Read-only view of agent state in our Cosmos DB | hop 7 (Cosmos DB) |
@@ -218,6 +222,14 @@ In the web UI each answer shows its searches, citations, agent version and token
 - *Change:* sign in with a different account from your tenant that isn't assigned to the app.
 - *Observe:* Entra ID refuses with `AADSTS50105` before the app is reached.
 - *Explain:* `appRoleAssignmentRequired: true` on the service principal. To grant access, assign a user, or preferably a group (Enterprise applications → the app → Users and groups, or a `Microsoft.Graph/appRoleAssignedTo` resource in Bicep).
+
+### Step 4b
+
+**17. Two data stores, two owners**
+- *Predict:* where is the *title* of a chat stored, and where are its *messages*?
+- *Change:* chat in the web app, then look at both: app Cosmos → `chat` → `sessions` (one small document per chat, in *your* schema), and Foundry's Cosmos → `enterprise_memory` → `…-run-state-v1` (the content, in *Foundry's* schema).
+- *Observe (2026-11-17, local, two simulated users):* Alice's list showed her 2 chats, newest activity first. Reopening one returned all 4 messages (from Foundry's API). Bob's list was empty, and Bob loading Alice's chat got `404`.
+- *Explain:* the app never reads Foundry's containers. It stores **references** (conversation IDs) in its own model and asks Foundry for content. Partitioning by `user_oid` means "list my chats" can't return someone else's, by construction.
 
 ### Step 4
 

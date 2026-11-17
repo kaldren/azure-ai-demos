@@ -6,6 +6,7 @@ dependencies = [
     # Runtime client (chat.py): connects to a prompt agent that's already defined in Foundry.
     "agent-framework-foundry>=1.16.2",
     # Management (create_agent.py): creates and versions the agent definition.
+    "aiohttp>=3.14.5",
     "azure-ai-projects>=2.11.0",
     "azure-cosmos>=4.17.1",
     "azure-identity>=1.27.0",

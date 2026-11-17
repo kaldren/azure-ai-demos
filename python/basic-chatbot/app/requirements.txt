@@ -1,6 +1,8 @@
 # Installed by App Service's build (Oryx) during zip deploy. Keep in sync with ../pyproject.toml.
 agent-framework-foundry>=1.16.2
 azure-ai-projects>=2.11.0
+azure-cosmos>=4.17.1
+aiohttp>=3.10
 azure-identity>=1.27.0
 azure-monitor-opentelemetry>=1.8.10
 fastapi>=0.115

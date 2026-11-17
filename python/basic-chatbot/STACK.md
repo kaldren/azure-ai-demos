@@ -64,6 +64,7 @@ flowchart LR
 | **New project** for standard setup | Required | A project's storage can't be changed after creation | n/a. Plan the setup before the first real conversation. |
 | **User-assigned identity for the project** | Runtime + provisioning identity | Exists *before* the project, so roles can be granted before provisioning | System-assigned (template 41): works, but needs careful ordering |
 | **Cosmos DB serverless** | Thread storage | ~$0 idle | Provisioned ≥3000 RU/s for predictable latency (~$175/month). Zone redundancy and continuous backup for production. |
+| **App-owned sessions index** (separate serverless Cosmos, `/user_oid` partition) | "Your chats" list and reopen | Our schema for our feature. Never depend on Foundry's internal containers. Per-user partition = isolation by construction. | Foundry has no "list conversations by owner" query, so without this the UI can't list chats |
 | **One search service for knowledge *and* agent vectors** | Cost saving | ~$80/month less | **Deviation:** the baseline uses a dedicated one, so a compromise of one use doesn't expose the other. Split before production. |
 | **gpt-5.4-mini**, 50K TPM | Generation + tool use | Agent-supported, cheap. 10K TPM caused 429s with grounding. | Larger models: maybe fewer skipped searches under `auto` (untested) |
 | **Azure AI Search tool** | Single-index retrieval | In the reference, and transparent | Foundry IQ for multi-source agentic retrieval |

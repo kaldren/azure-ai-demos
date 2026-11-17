@@ -11,7 +11,8 @@ Three identities are involved, and keeping them apart is the point of this file:
 - **Authorization is ours**: a conversation is stamped with its owner's object ID (Foundry
   conversation metadata) and may only be resumed by that owner.
 
-State: the server is stateless. The browser holds the conversation ID and Foundry holds the history.
+State: the server is stateless. The browser holds the current conversation ID, Foundry holds the
+history, and the app's own Cosmos DB holds each user's list of conversations (step 4b, sessions.py).
 Telemetry: OpenTelemetry → Application Insights, tagged with the user's object ID (enduser.id).
 """
 
@@ -31,12 +32,15 @@ if os.getenv("APPLICATIONINSIGHTS_CONNECTION_STRING"):
 
 from agent_framework.foundry import FoundryAgent
 from azure.ai.projects.aio import AIProjectClient
+from azure.cosmos.aio import CosmosClient
 from azure.identity.aio import AzureCliCredential, ManagedIdentityCredential
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 from openai import BadRequestError, NotFoundError
 from opentelemetry import trace
 from pydantic import BaseModel, Field
+
+from sessions import SessionStore
 
 log = logging.getLogger("chatbot")
 log.setLevel(logging.INFO)
@@ -102,7 +106,12 @@ async def lifespan(app: FastAPI):
         agent_version=os.environ["FOUNDRY_AGENT_VERSION"],
         timeout=120.0,
     )
+    # The app's own data store (same managed identity, different Cosmos account from Foundry's).
+    cosmos = CosmosClient(os.environ["APP_COSMOS_ENDPOINT"], credential=credential)
+    container = cosmos.get_database_client(os.getenv("APP_COSMOS_DATABASE", "chat")).get_container_client("sessions")
+    app.state.sessions = SessionStore(container)
     yield
+    await cosmos.close()
     await project.close()
     await credential.close()
 
@@ -187,6 +196,7 @@ async def chat(request: ChatRequest, user: User = Depends(current_user)) -> Chat
         log.exception("Chat turn failed (user=%s conversation=%s)", user.oid, request.conversation_id)
         raise HTTPException(status_code=502, detail="The assistant is unavailable. Try again shortly.")
 
+    await app.state.sessions.record_turn(user.oid, conversation_id, request.message)
     searches, citations = retrieval_trace(result)
     usage = result.usage_details or {}
     log.info(
@@ -202,6 +212,34 @@ async def chat(request: ChatRequest, user: User = Depends(current_user)) -> Chat
         input_tokens=usage.get("input_token_count"),
         output_tokens=usage.get("output_token_count"),
     )
+
+
+@app.get("/api/sessions")
+async def list_sessions(user: User = Depends(current_user)) -> list[dict]:
+    """The signed-in user's conversations, newest first (from the app's own Cosmos DB)."""
+    return await app.state.sessions.list(user.oid)
+
+
+@app.get("/api/sessions/{conversation_id}/messages")
+async def session_messages(conversation_id: str, user: User = Depends(current_user)) -> list[dict]:
+    """Reload a conversation's messages through Foundry's API (not by reading Foundry's Cosmos).
+
+    The same ownership check as resuming: only the owner gets the messages.
+    """
+    try:
+        await open_conversation(conversation_id, user)  # raises 400/404 unless the user owns it
+        items = app.state.openai.conversations.items.list(conversation_id, order="asc", limit=100)
+        messages = []
+        async for item in items:
+            if item.type == "message" and item.role in ("user", "assistant"):
+                text = " ".join(getattr(part, "text", "") or "" for part in item.content)
+                messages.append({"role": item.role, "text": text})
+        return messages
+    except HTTPException:
+        raise
+    except Exception:
+        log.exception("Loading messages failed (user=%s conversation=%s)", user.oid, conversation_id)
+        raise HTTPException(status_code=502, detail="Couldn't load that conversation. Try again shortly.")
 
 
 @app.get("/api/me")

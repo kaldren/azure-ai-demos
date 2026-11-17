@@ -404,6 +404,9 @@ resource webApp 'Microsoft.Web/sites@2024-11-01' = {
         // Step 3b: tells App Service authentication to use this managed identity's token as the
         // client assertion instead of a client secret. The value is the MI's *client* ID.
         { name: 'OVERRIDE_USE_MI_FIC_ASSERTION_CLIENTID', value: authIdentity.properties.clientId }
+        // Step 4b: the app's own data (sessions list), in a Cosmos account separate from Foundry's.
+        { name: 'APP_COSMOS_ENDPOINT', value: appCosmos.properties.documentEndpoint }
+        { name: 'APP_COSMOS_DATABASE', value: appCosmosDatabaseName }
       ]
     }
   }
@@ -690,6 +693,77 @@ resource stdTraceReaders 'Microsoft.Authorization/roleAssignments@2022-04-01' = 
 ]
 
 // ---------------------------------------------------------------------------------------------
+// Step 4b: "My previous chats". The app's OWN data model, next to Foundry's.
+// Foundry owns the conversation content (enterprise_memory, internal format). The app owns a
+// small index of who has which conversations, so the UI can list and reopen them.
+// Separate Cosmos account on purpose: the baseline keeps Foundry's dependency resources for
+// Foundry only, and serverless costs ~$0 when idle.
+// ---------------------------------------------------------------------------------------------
+
+var appCosmosDatabaseName = 'chat'
+
+resource appCosmos 'Microsoft.DocumentDB/databaseAccounts@2025-04-15' = {
+  name: 'cosmos-${baseName}-app-${suffix}'
+  location: location
+  kind: 'GlobalDocumentDB'
+  properties: {
+    databaseAccountOfferType: 'Standard'
+    capabilities: [{ name: 'EnableServerless' }]
+    consistencyPolicy: { defaultConsistencyLevel: 'Session' }
+    locations: [{ locationName: location, failoverPriority: 0, isZoneRedundant: false }]
+    disableLocalAuth: true
+    minimalTlsVersion: 'Tls12'
+    publicNetworkAccess: 'Enabled' // step 5: private endpoint
+  }
+
+  resource database 'sqlDatabases' = {
+    name: appCosmosDatabaseName
+    properties: { resource: { id: appCosmosDatabaseName } }
+
+    // One document per conversation. Partitioned by the user's Entra object ID, so "list my
+    // chats" is a single-partition query and can never touch another user's documents.
+    resource sessions 'containers' = {
+      name: 'sessions'
+      properties: {
+        resource: {
+          id: 'sessions'
+          partitionKey: { paths: ['/user_oid'], kind: 'Hash' }
+          indexingPolicy: {
+            indexingMode: 'consistent'
+            includedPaths: [{ path: '/updated_at/?' }] // the only field we sort on
+            excludedPaths: [{ path: '/*' }] // keep writes cheap: index nothing else
+          }
+        }
+      }
+    }
+  }
+}
+
+// The web app reads and writes sessions (Cosmos data-plane role, scoped to the 'chat' database).
+resource webAppSessionsData 'Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignments@2025-04-15' = {
+  parent: appCosmos
+  name: guid(appCosmos.id, webApp.id, stdRoles.cosmosDataContributor)
+  properties: {
+    principalId: webApp.identity.principalId
+    roleDefinitionId: '${appCosmos.id}/sqlRoleDefinitions/${stdRoles.cosmosDataContributor}'
+    scope: '${appCosmos.id}/dbs/${appCosmosDatabaseName}'
+  }
+  dependsOn: [appCosmos::database]
+}
+
+// You, for running the app locally (until step 5 makes this account private).
+resource userSessionsData 'Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignments@2025-04-15' = {
+  parent: appCosmos
+  name: guid(appCosmos.id, userPrincipalId, stdRoles.cosmosDataContributor)
+  properties: {
+    principalId: userPrincipalId
+    roleDefinitionId: '${appCosmos.id}/sqlRoleDefinitions/${stdRoles.cosmosDataContributor}'
+    scope: '${appCosmos.id}/dbs/${appCosmosDatabaseName}'
+  }
+  dependsOn: [webAppSessionsData] // Cosmos role assignments must not run in parallel
+}
+
+// ---------------------------------------------------------------------------------------------
 // Step 3b: Entra ID sign-in for the web app (App Service built-in authentication)
 // Docs: https://learn.microsoft.com/azure/app-service/configure-authentication-provider-aad
 // ---------------------------------------------------------------------------------------------
@@ -796,3 +870,4 @@ output stdProjectEndpoint string = 'https://${account.name}.services.ai.azure.co
 output cosmosAccountName string = cosmos.name
 output stdSearchConnectionName string = stdSearchConnection.name
 output agentStorageName string = agentStorage.name
+output appCosmosEndpoint string = appCosmos.properties.documentEndpoint

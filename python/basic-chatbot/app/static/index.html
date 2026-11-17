@@ -5,14 +5,23 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Contoso Policy Chat</title>
   <style>
-    :root { --bg: #f6f7f9; --panel: #fff; --text: #1d2330; --muted: #667085; --accent: #2f5bea; --me: #e8eeff; --border: #e3e6ec; }
+    :root { --bg: #f6f7f9; --panel: #fff; --text: #1d2330; --muted: #667085; --accent: #2f5bea; --me: #e8eeff; --border: #e3e6ec; --active: #eef2ff; }
     @media (prefers-color-scheme: dark) {
-      :root { --bg: #111318; --panel: #1a1d24; --text: #e6e8ee; --muted: #9aa3b2; --accent: #7c9cff; --me: #232c45; --border: #2a2f3a; }
+      :root { --bg: #111318; --panel: #1a1d24; --text: #e6e8ee; --muted: #9aa3b2; --accent: #7c9cff; --me: #232c45; --border: #2a2f3a; --active: #232a3d; }
     }
     * { box-sizing: border-box; }
     body { margin: 0; font: 15px/1.5 system-ui, -apple-system, Segoe UI, sans-serif; background: var(--bg); color: var(--text); }
-    main { max-width: 760px; margin: 0 auto; padding: 16px; display: flex; flex-direction: column; height: 100dvh; }
-    header { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
+    .layout { display: flex; height: 100dvh; max-width: 1100px; margin: 0 auto; }
+    aside { width: 260px; flex-shrink: 0; border-right: 1px solid var(--border); padding: 16px 12px; display: flex; flex-direction: column; gap: 8px; overflow-y: auto; }
+    aside h2 { font-size: 13px; font-weight: 600; color: var(--muted); margin: 8px 4px 0; text-transform: uppercase; letter-spacing: .04em; }
+    #sessions { display: flex; flex-direction: column; gap: 2px; }
+    #sessions button { text-align: left; background: transparent; color: var(--text); padding: 8px 10px; border-radius: 8px; font-size: 14px; }
+    #sessions button:hover { background: var(--active); }
+    #sessions button.active { background: var(--active); font-weight: 600; }
+    #sessions small { display: block; color: var(--muted); font-size: 11px; font-weight: 400; }
+    .empty { color: var(--muted); font-size: 13px; padding: 4px 10px; }
+    main { flex: 1; min-width: 0; padding: 16px; display: flex; flex-direction: column; }
+    header { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; }
     h1 { font-size: 18px; margin: 0; }
     #meta { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
     #log { flex: 1; overflow-y: auto; padding: 12px 0; display: flex; flex-direction: column; gap: 10px; }
@@ -22,34 +31,46 @@
     .trace span { display: block; }
     .err { border-color: #d64545; }
     form { display: flex; gap: 8px; }
-    input { flex: 1; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--panel); color: var(--text); font: inherit; }
+    input { flex: 1; min-width: 0; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--panel); color: var(--text); font: inherit; }
     button { padding: 10px 14px; border-radius: 8px; border: 0; background: var(--accent); color: #fff; font: inherit; cursor: pointer; }
     button.secondary { background: transparent; color: var(--accent); border: 1px solid var(--border); }
     button:disabled { opacity: .5; cursor: default; }
     header > div { display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--muted); }
     #signout { color: var(--accent); }
+    /* Phones: the chat list moves above the conversation and scrolls on its own. */
+    @media (max-width: 720px) {
+      .layout { flex-direction: column; }
+      aside { width: auto; max-height: 30dvh; border-right: 0; border-bottom: 1px solid var(--border); padding: 12px 16px; }
+    }
   </style>
 </head>
 <body>
-<main>
-  <header>
-    <h1>Contoso policy assistant</h1>
-    <div>
-      <span id="user"></span>
-      <!-- App Service authentication endpoint: clears the session cookie and signs out of Entra ID -->
-      <a href="/.auth/logout?post_logout_redirect_uri=/" id="signout">Sign out</a>
-      <button class="secondary" id="new" type="button">New conversation</button>
-    </div>
-  </header>
-  <div id="meta">No conversation yet</div>
-  <div id="log" aria-live="polite"></div>
-  <form id="form">
-    <input id="input" autocomplete="off" maxlength="2000" placeholder="Ask about travel, expenses or remote work…" required>
-    <button id="send">Send</button>
-  </form>
-</main>
+<div class="layout">
+  <aside>
+    <button class="secondary" id="new" type="button">+ New conversation</button>
+    <h2>Your chats</h2>
+    <div id="sessions"><div class="empty">Loading…</div></div>
+  </aside>
+  <main>
+    <header>
+      <h1>Contoso policy assistant</h1>
+      <div>
+        <span id="user"></span>
+        <!-- App Service authentication endpoint: clears the session cookie and signs out of Entra ID -->
+        <a href="/.auth/logout?post_logout_redirect_uri=/" id="signout">Sign out</a>
+      </div>
+    </header>
+    <div id="meta">No conversation yet</div>
+    <div id="log" aria-live="polite"></div>
+    <form id="form">
+      <input id="input" autocomplete="off" maxlength="2000" placeholder="Ask about travel, expenses or remote work…" required>
+      <button id="send">Send</button>
+    </form>
+  </main>
+</div>
 <script>
-  // The browser keeps the Foundry conversation ID; the server stays stateless.
+  // The browser keeps the CURRENT Foundry conversation ID. The list of past chats comes from the
+  // server (the app's own Cosmos DB), and their messages from Foundry, so it works on any device.
   const KEY = "conversation_id";
   const store = {
     get() { try { return sessionStorage.getItem(KEY); } catch { return null; } },
@@ -74,9 +95,59 @@
   function showMeta() {
     const id = store.get();
     $("meta").textContent = id ? "Conversation " + id : "No conversation yet";
+    for (const b of document.querySelectorAll("#sessions button")) b.classList.toggle("active", b.dataset.id === id);
   }
 
-  $("new").onclick = () => { store.set(null); $("log").innerHTML = ""; showMeta(); };
+  // Fetch JSON from our API, turning App Service's sign-in redirect into a readable error.
+  async function api(url, options) {
+    const res = await fetch(url, options);
+    if (res.redirected || !(res.headers.get("content-type") || "").includes("application/json")) {
+      throw new Error("Your sign-in has expired. Reload the page to sign in again.");
+    }
+    const data = await res.json();
+    return { res, data };
+  }
+
+  async function loadSessions() {
+    try {
+      const { res, data } = await api("/api/sessions");
+      if (!res.ok) throw new Error(data.detail || res.statusText);
+      const list = $("sessions");
+      list.innerHTML = "";
+      if (!data.length) { list.innerHTML = '<div class="empty">No chats yet</div>'; return; }
+      for (const s of data) {
+        const b = document.createElement("button");
+        b.type = "button";
+        b.dataset.id = s.conversation_id;
+        b.textContent = s.title;
+        const when = document.createElement("small");
+        when.textContent = new Date(s.updated_at).toLocaleString();
+        b.appendChild(when);
+        b.onclick = () => openSession(s.conversation_id);
+        list.appendChild(b);
+      }
+      showMeta();
+    } catch (err) {
+      $("sessions").innerHTML = "";
+      const d = document.createElement("div"); d.className = "empty"; d.textContent = err.message;
+      $("sessions").appendChild(d);
+    }
+  }
+
+  async function openSession(id) {
+    $("log").innerHTML = "";
+    try {
+      const { res, data } = await api(`/api/sessions/${encodeURIComponent(id)}/messages`);
+      if (!res.ok) throw new Error(data.detail || res.statusText);
+      store.set(id);
+      showMeta();
+      for (const m of data) add(m.text, m.role === "user" ? "me" : "");
+    } catch (err) {
+      add("Error: " + err.message, "err");
+    }
+  }
+
+  $("new").onclick = () => { store.set(null); $("log").innerHTML = ""; showMeta(); $("input").focus(); };
 
   $("form").onsubmit = async (e) => {
     e.preventDefault();
@@ -86,30 +157,24 @@
     $("input").value = "";
     $("send").disabled = true;
     try {
-      const res = await fetch("/api/chat", {
+      const { res, data } = await api("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ message, conversation_id: store.get() }),
       });
-      // An expired sign-in makes App Service answer with a redirect to the Entra login page,
-      // which fetch can't follow cross-origin. Detect it instead of failing to parse JSON.
-      if (res.redirected || !(res.headers.get("content-type") || "").includes("application/json")) {
-        throw new Error("Your sign-in has expired. Reload the page to sign in again.");
-      }
-      const data = await res.json();
       if (res.status === 404) {
         store.set(null); showMeta();  // not found or not yours: start fresh
         throw new Error("That conversation isn't available. Your next message starts a new one.");
       }
       if (!res.ok) throw new Error(data.detail || res.statusText);
       store.set(data.conversation_id);
-      showMeta();
       const trace = [
         ...(data.searches.length ? data.searches.map((q) => "🔎 searched: " + q) : ["no search"]),
         ...data.citations.map((c) => "📄 cited: " + c),
         `${data.agent} · tokens in/out ${data.input_tokens}/${data.output_tokens}`,
       ];
       add(data.answer, "", trace);
+      loadSessions();  // a new chat appears in the list; an existing one moves to the top
     } catch (err) {
       add("Error: " + err.message, "err");
     } finally {
@@ -117,7 +182,9 @@
       $("input").focus();
     }
   };
+
   showMeta();
+  loadSessions().then(() => { if (store.get()) openSession(store.get()); });
   fetch("/api/me").then((r) => r.ok ? r.json() : null).then((me) => {
     if (me) $("user").textContent = "Signed in as " + me.name;
   }).catch(() => {});

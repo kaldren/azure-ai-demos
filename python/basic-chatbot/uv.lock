@@ -426,6 +426,7 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "agent-framework-foundry" },
+    { name = "aiohttp" },
     { name = "azure-ai-projects" },
     { name = "azure-cosmos" },
     { name = "azure-identity" },
@@ -440,6 +441,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "agent-framework-foundry", specifier = ">=1.16.2" },
+    { name = "aiohttp", specifier = ">=3.14.5" },
     { name = "azure-ai-projects", specifier = ">=2.11.0" },
     { name = "azure-cosmos", specifier = ">=4.17.1" },
     { name = "azure-identity", specifier = ">=1.27.0" },
