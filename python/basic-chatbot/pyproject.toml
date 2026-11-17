@@ -1,0 +1,18 @@
+[project]
+name = "basic-chatbot"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    # Runtime client (chat.py): connects to a prompt agent that's already defined in Foundry.
+    "agent-framework-foundry>=1.16.2",
+    # Management (create_agent.py): creates and versions the agent definition.
+    "azure-ai-projects>=2.11.0",
+    "azure-cosmos>=4.17.1",
+    "azure-identity>=1.27.0",
+    "azure-monitor-opentelemetry>=1.8.10",
+    "azure-search-documents>=12.1.0",
+    "fastapi>=0.163.1",
+    "openai>=3.51.0",
+    "python-dotenv",
+    "uvicorn>=0.54.0",
+]
