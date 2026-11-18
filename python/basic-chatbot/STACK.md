@@ -1,4 +1,4 @@
-# STACK: basic chatbot, steps 1–5
+# STACK: basic chatbot, steps 1–6a
 
 ## Problem and scope
 
@@ -13,6 +13,7 @@
 | 3b | How do end users sign in without the app holding a secret, and how do we stop one user reading another's conversation? |
 | 4 | What does it take for agent state to live in resources *we* own, and what does it cost? |
 | 5 | Can everything except the web app be unreachable from the internet, and what does that change? |
+| 6a | Can we control and audit what the agent and app send to the internet? |
 
 **Assumptions:** a learning build, a 16-chunk synthetic corpus, public endpoints secured by Entra ID. **Decisions made:** Bicep · Agent Framework `FoundryAgent` · Sweden Central ·
 Azure AI Search tool (not Foundry IQ) · AI Search Basic with hybrid vectors · **forced retrieval
@@ -21,7 +22,8 @@ federated credential (no secret), assigned users only, ownership in conversation
 **standard setup in a new project via capability hosts (GA, as in the baseline repo), serverless Cosmos DB,
 search service shared between knowledge and agent vector store (deviation)** · **step 5: VNet + private endpoints +
 private DNS, network-injected agent in a NEW Foundry resource (old one deleted), public access off everywhere
-except the web app, no IP exceptions, Search→Foundry via the trusted-services exception**.
+except the web app, no IP exceptions, Search→Foundry via the trusted-services exception** · **step 6a: Azure
+Firewall Basic with an on/off switch, default-deny FQDN allow-list, route table on agent + app subnets**.
 
 ## How it works
 
@@ -77,6 +79,10 @@ VNet 10.20.0.0/16 ──────┼─────────────�
      Foundry agent runtime (network injection) ─────────────┘
   6 private DNS zones (privatelink.*) linked to the VNet
 ───────────────────────────────────────────────────────────────────────────────────────
+  AzureFirewallSubnet 10.20.3.0/26: Azure Firewall (Basic) 10.20.3.4 ──▶ internet from ONE public IP
+     ▲ route table on snet-agent + snet-appsvc: 0.0.0.0/0 → 10.20.3.4 (private 10.20.x traffic stays direct)
+     policy: default DENY; allow Entra ID (service tag), App Insights, agent platform FQDNs, PyPI (app only)
+───────────────────────────────────────────────────────────────────────────────────────
   Search ──(trusted Azure services exception, MI + RBAC)──▶ Foundry embedding model
   Public network access: Disabled on Foundry, Search, Cosmos ×2, Storage
 ```
@@ -98,7 +104,9 @@ VNet 10.20.0.0/16 ──────┼─────────────�
 | **New Foundry resource** for step 5 | Network injection must exist from creation | No supported way to add it to the step 1–4 account | n/a. Decide on networking before the first production agent. |
 | **Two-phase rollout** (`lockDown` param) | Build and migrate with public access on, then close it | Lets local tools finish setup (agent, index) before we lose access | Build from inside the VNet (jump box/CI runner, step 7) |
 | **Trusted-services exception for Search → Foundry** | Vectorizer reaches the embedding model | Search Basic can't do a shared private link to Foundry; Microsoft's own private Foundry IQ tutorial relies on this bypass | Search S1 (~$245/month) with a shared private link; or non-vector query types |
-| **Default outbound access on agent/app subnets** | Egress to Entra ID and App Insights | New subnets are private by default | NAT Gateway, or Azure Firewall with FQDN rules (step 6) |
+| **Azure Firewall Basic + route table** (step 6a) | Egress control: default deny, FQDN allow-list, logs | Concepts identical to Standard at ~1/3 the cost (~$0.40/h). On/off parameter to save cost between sessions. | Standard (~$1.25/h): DNS proxy, threat-intel deny, web categories (the baseline's choice). NAT Gateway: egress without filtering. |
+| **Allow-list from evidence** | Rules = documented platform needs + what the deny log shows | Each rule has a reason (e.g. PyPI found by a failed build) | Broad service tags or `*` rules (simpler, much weaker) |
+| **Default outbound access kept on agent/app subnets** | Fallback path when the firewall is switched off | The UDR overrides it while the firewall exists | Turn it off (then egress breaks completely when the firewall is off) |
 | **One search service for knowledge *and* agent vectors** | Cost saving | ~$80/month less | **Deviation:** the baseline uses a dedicated one, so a compromise of one use doesn't expose the other. Split before production. |
 | **gpt-5.4-mini**, 50K TPM | Generation + tool use | Agent-supported, cheap. 10K TPM caused 429s with grounding. | Larger models: maybe fewer skipped searches under `auto` (untested) |
 | **Azure AI Search tool** | Single-index retrieval | In the reference, and transparent | Foundry IQ for multi-source agentic retrieval |
@@ -178,6 +186,18 @@ conversation ID, and is absent across `/new`. Input tokens grow every turn.
 | **A deployed build not running** | `/healthz/deps` was 404 although the deployed archive contained it. `az webapp restart` fixed it. | Check a new route or version after deploys |
 | **Retiring a Foundry resource has an order** | `CannotDeleteResource … nested resources exist` → delete project capability host → projects → account capability host → account → purge | Script teardown. The old identities' role assignments were removed first (0 orphans left). |
 
+**Step 6a (2026-11-18):**
+
+| Observation | Evidence | Implication |
+|---|---|---|
+| **Default deny works, and allow-listing is a deploy** | `/healthz/egress` → `example.com`: `ConnectError` in 291 ms. Log: `Deny 10.20.2.62 → example.com "No rule matched"`. After `experimentAllowedFqdns=["example.com"]` (6 min deploy): `200`, log `Allow … rule=experiment-allowed-sites`. | New outbound dependencies (public APIs, MCP servers for agents) become reviewed, scoped, auditable rules |
+| **The firewall surfaced hidden dependencies** | The first deploy failed: `pip` → `pypi.org` reset (`SSL: UNEXPECTED_EOF`). Steady `Deny dc.services.visualstudio.com` from the App Service platform. | Egress control is also discovery. PyPI allowed for the app subnet only; the platform telemetry stays blocked. |
+| **The agent's internet traffic is tiny** | Agent subnet, whole session: App Insights (Allow), Entra ID (Allow), 3× `…tenant.api.powerplatform.com` (Deny, purpose unknown). Chat at 18:13 succeeded (search tool 227 ms) with the firewall on. | Data paths are private (endpoints). Unknown destinations stay denied until justified. |
+| **A failed build took the app down for ~4.5 h** | App Service metrics: 5xx from 09:23 to 13:53, until the next successful deploy. Not noticed because I checked the firewall, not the app. | On-server builds aren't atomic. Use slots or CI-built packages. `deploy_app.sh` now restarts and gates on `/healthz/deps`. |
+| **Stale process after deploy (2nd time)** | `/healthz/egress` 404 until `az webapp restart` | Restart is now part of `deploy_app.sh` |
+| **Our telemetry passes, logs lag** | Allowed: `swedencentral-0.in.applicationinsights.azure.com`, live metrics, SDK settings. Log tables appeared ~15 min after the firewall was created; metrics were immediate. | Use metrics for "is traffic flowing?" and logs for "what exactly?" |
+| A plain redeploy could reopen public access | `lockDown` defaulted to `false` | Default changed to `true`. Safe defaults for security parameters. |
+
 Small samples on one model: treat these as observations, not guarantees.
 
 ## When to propose it
@@ -187,9 +207,10 @@ from a web app with no secrets in config, plus server- and client-side traces fo
 Users sign in with Entra ID, only assigned users get in, and each user can only resume their own conversations.
 Agent state now lives in resources you own (Cosmos DB, Storage, Search).
 Data services are reachable only from inside the VNet.
-**Main adoption risks:** (1) **egress is uncontrolled**: a compromised agent or app can reach any internet
-address (step 6: Azure Firewall); (2) the web app's inbound has no WAF (step 6); (3) operators have no
-private access path (step 7: Bastion + jump box); (4) retrieval quality is checked by a 5-question eval. **Next validation:** a larger eval set, and
+Egress is default-deny with an auditable allow-list.
+**Main adoption risks:** (1) the web app's inbound has no WAF (step 6b); (2) no NSGs, so subnets aren't
+segmented from each other; (3) operators have no private access path (step 7); (4) on-server builds aren't
+atomic (use slots or CI builds); (5) retrieval quality is checked by a 5-question eval. **Next validation:** a larger eval set, and
 assignment via a security group rather than individual users.
 
 ## Beyond the demo (gaps that matter here)
@@ -197,7 +218,8 @@ assignment via a security group rather than individual users.
 - The **user's identity isn't passed to Foundry**. The app calls as itself, so Foundry-side audit and Purview see the app, not the person (the baseline calls this out).
 - Anyone with *Foundry User* on the project can still read every conversation through the API, and anyone with Cosmos data roles can read them directly. Keep both role lists short.
 - One search service serves both knowledge and agent vectors (deviation from the baseline). Cosmos DB has no zone redundancy or continuous backup.
-- App Service inbound is public without a WAF (step 6). Outbound internet from `snet-agent`/`snet-appsvc` is unrestricted (step 6 firewall).
+- App Service inbound is public without a WAF (step 6b). No NSGs yet.
+- The firewall is Basic (no threat-intel deny, no DNS proxy) and can be switched off; when it's off, egress is unrestricted again.
 - Search → Foundry uses the trusted-services exception, not a private endpoint (needs Search S1+). No NSGs on subnets yet.
 - No private operator access: setup changes need `lockDown=false` temporarily (step 7 jump box/CI runner).
 - Single B1 instance, no zone redundancy (the diagram shows 3 zones).

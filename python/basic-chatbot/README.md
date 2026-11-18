@@ -1,4 +1,4 @@
-# Basic chatbot (steps 1–5 of the baseline Foundry chat architecture)
+# Basic chatbot (steps 1–6a of the baseline Foundry chat architecture)
 
 **What it shows:** the core of the [baseline Microsoft Foundry chat architecture](https://learn.microsoft.com/azure/architecture/ai-ml/architecture/baseline-microsoft-foundry-chat)
 ([diagram](chatbot-architecture.jpg)), built one step at a time.
@@ -9,10 +9,11 @@
 - **Step 4:** **standard agent setup**. A new project (`proj-chatbot-std`) stores agent definitions and conversations in **our own Cosmos DB**, files in **our own Storage account**, and vector stores in our AI Search service. The old basic project (`proj-chatbot`, agents v1–v4) is kept for comparison.
 - **Step 4b:** **"Your chats" sidebar**. The app keeps its *own* index of each user's conversations (title, timestamps) in a **separate** serverless Cosmos account, partitioned by user. Reopening a chat loads its messages through Foundry's API.
 - **Step 5:** **private networking**. A VNet with private endpoints and private DNS for Foundry, AI Search, both Cosmos DB accounts and Storage; the agent runs **inside** the VNet (network injection); the web app's outbound traffic goes through the VNet. **Public network access is disabled on everything except the web app.** This required a new Foundry resource; the step 1–4 one was deleted and purged.
+- **Step 6a:** **egress control**. Azure Firewall (Basic) with a route table on the agent and app subnets: internet-bound traffic must pass a **default-deny** allow-list, and every attempt is logged. It can be switched off between sessions (`deployFirewall=false`).
 
 Why it's built this way, and what we observed: [STACK.md](STACK.md).
 
-> Status: steps 1–5 deployed and verified on 2026-11-15/18 (resource group `rg-basic-chatbot`, Sweden Central).
+> Status: steps 1–6a deployed and verified on 2026-11-15/18 (resource group `rg-basic-chatbot`, Sweden Central).
 > Web app: `https://app-chatbot-5gq6mtdeqpdcw.azurewebsites.net`. **Entra sign-in is required, and only assigned users get in.**
 > **Hourly billing while it exists:** AI Search Basic ~$0.11/h + App Service B1 ~$0.018/h. See [Cleanup](#cleanup).
 
@@ -40,6 +41,8 @@ Defined in [`infra/main.bicep`](infra/main.bicep), region Sweden Central:
 | **VNet** `10.20.0.0/16`: `snet-agent` (/24, delegated to `Microsoft.App/environments`), `snet-pe` (/24), `snet-appsvc` (/26, delegated to `Microsoft.Web/serverFarms`) | 5 | free |
 | **5 private endpoints** (Foundry, Search, Cosmos ×2, Storage blob) + **6 private DNS zones** linked to the VNet | 5 | ~$36 + ~$3 / month |
 | **Foundry resource `fdy-chatbot-vnet-…`** with network injection into `snet-agent`; replaces the step 1–4 resource | 5 | none at idle |
+| **Azure Firewall (Basic)** `afw-chatbot-…` in `AzureFirewallSubnet` (10.20.3.0/26, private IP 10.20.3.4) + `AzureFirewallManagementSubnet` (10.20.3.64/26), 2 public IPs, firewall policy `egress-allow-list`, logs to Log Analytics | 6a | **~$0.40/hour** + $0.065/GB; switch off with `deployFirewall=false` |
+| Route table `rt-egress-…` on `snet-agent` + `snet-appsvc`: `0.0.0.0/0 → 10.20.3.4` (empty when the firewall is off) | 6a | free |
 
 Role assignments (all keyless):
 
@@ -66,14 +69,25 @@ Only the **web app** is reachable from the internet. Foundry, Search, both Cosmo
 refuse public calls, **even with a valid token** (403 / Forbidden). From your laptop, `create_agent.py`,
 `ingest.py`, `search.py`, `evaluate.py`, `inspect_cosmos.py`, `chat.py`, Data Explorer and the Foundry
 portal's agent pages no longer work. That's the point. Private developer access (Bastion + jump box) is step 7.
-To work from a laptop temporarily, redeploy with `-p lockDown=false`, then redeploy with `lockDown=true`.
+To work from a laptop temporarily, redeploy with `-p lockDown=false`, then redeploy without it. `lockDown` **defaults to `true`**, so a plain redeploy never reopens public access by accident.
 
-Verify the private path without signing in:
+Verify the private path and the firewall without signing in:
 
 ```bash
 curl https://<webAppName>.azurewebsites.net/healthz/deps
 # {"foundry":{"private_ip":true,"ok":true},"app_cosmos":{"private_ip":true,"ok":true}}
+curl https://<webAppName>.azurewebsites.net/healthz/egress     # fixed target: https://example.com/
+# firewall on, not allowed:  {"reachable":false,"error":"ConnectError",…}
+# allowed (experimentAllowedFqdns='["example.com"]') or firewall off:  {"reachable":true,"status":200,…}
 ```
+
+Firewall switches (Bicep parameters, all default to the safe value):
+
+| Parameter | Default | Effect |
+|---|---|---|
+| `lockDown` | `true` | `false` reopens public access on data services (temporary laptop work) |
+| `deployFirewall` | `true` | `false` empties the route table (egress goes direct, unrestricted). It does **not** delete the firewall: delete it separately to stop billing (see Cleanup). |
+| `experimentAllowedFqdns` | `[]` | extra hostnames the **app** subnet may reach, e.g. `'["example.com"]'` |
 
 ## Deploy
 
@@ -303,6 +317,27 @@ In the web UI each answer shows its searches, citations, agent version and token
 **22. What's still open: egress**
 - *Explain:* `snet-agent` and `snet-appsvc` have default outbound internet access (the agent needs Entra ID, the app needs App Insights). A compromised component could still send data to any internet address. Step 6's Azure Firewall (route table `0.0.0.0/0 → firewall`, FQDN allow-list) closes it.
 
+### Step 6a
+
+**23. Default deny, then allow-list (the firewall experiment)**
+- *Predict:* the app tries `https://example.com/` from inside the VNet. What happens before and after adding one rule?
+- *Change:* `curl <app>/healthz/egress`, then redeploy with `-p experimentAllowedFqdns='["example.com"]'` (~6 min), then curl again. Redeploy without it to remove the rule.
+- *Observe (2026-11-18):* before: `reachable:false, ConnectError` in 291 ms. After: `reachable:true, status 200`. The firewall log (`AZFWApplicationRule`) shows `Deny 10.20.2.62 → example.com "No rule matched. Proceeding with default action"` three times, then `Allow … rule=experiment-allowed-sites`.
+- *Explain:* nothing leaves unless a rule names it. A new outbound dependency (a public API, an MCP server for the agent) is a reviewed, versioned rule, scoped by source subnet, protocol and hostname. Every attempt is auditable.
+
+**24. The firewall finds dependencies you didn't know about**
+- *Observe (2026-11-18):* the first app deploy through the firewall failed. The build log showed `Could not fetch URL https://pypi.org/simple/pip/: … SSL: UNEXPECTED_EOF`, which is what a firewall reset looks like from the client side. The firewall log also shows a steady `Deny … dc.services.visualstudio.com` (legacy App Insights endpoint) from the App Service platform. Our own telemetry uses `*.in.applicationinsights.azure.com` and is allowed.
+- *Also observed:* from the **agent** subnet, the only internet traffic was App Insights (allowed), Entra ID (allowed via the service tag) and 3 denied calls to `il-<tenant-id>.<nn>.tenant.api.powerplatform.com`, a Power Platform tenant API. Its purpose isn't in the Foundry allow-list docs, and chats work with it blocked, so it **stays blocked** (open question). The agent's real work (Search, Cosmos DB, Storage) never touches the firewall: it goes through private endpoints.
+- *Explain:* egress control turns implicit dependencies into explicit ones. PyPI is now allowed for the app subnet only. The unexplained calls stay blocked: the default for egress is "deny until you can justify it".
+
+**25. A blocked build took the app down (and nobody noticed)**
+- *Observe:* App Service platform metrics: from 09:23 to 13:53 almost every request was 5xx. The failed on-server build left the app unable to start until the next successful deploy.
+- *Explain:* zip deploy with an on-server build (`SCM_DO_BUILD_DURING_DEPLOYMENT`) isn't atomic. Fixes: deployment slots + swap (Standard tier or higher), building in CI and shipping a finished package, and a post-deploy health gate. `deploy_app.sh` now restarts the app and requires `/healthz/deps` to return 200.
+
+**26. One public IP for everything that leaves**
+- *Observe:* all allowed egress from the agent and app subnets leaves from the firewall's public IP (`az network public-ip show -g rg-basic-chatbot -n pip-fw-<suffix> --query ipAddress`).
+- *Explain:* external partners can allow-list a single, stable address. Without the firewall, outbound IPs are shared and change.
+
 ## Troubleshooting
 
 - **`tool_user_error` (400) from a grounded agent**: the *project* identity lacks roles on Search (see the RBAC table), or a new role hasn't propagated yet.
@@ -323,13 +358,34 @@ In the web UI each answer shows its searches, citations, agent version and token
 - **The app's outbound traffic isn't routed through the VNet**: `siteConfig.vnetRouteAllEnabled` is silently ignored by `Microsoft.Web/sites@2024-11-01`. Use `properties.outboundVnetRouting.applicationTraffic: true` and check the deployed value.
 - **New app code deployed but the old code still answers**: the zip deploy succeeded, but the process wasn't restarted. Run `az webapp restart` and verify a new route.
 - **App Insights query returns nothing for older data**: `az monitor app-insights query` searches only the **last hour** unless you pass `--offset` (e.g. `--offset 2d`), whatever the query's `ago()` says.
+- **App build fails with `SSL: UNEXPECTED_EOF_WHILE_READING` / `Could not fetch URL https://pypi.org…`**: the firewall blocks PyPI. Allow `pypi.org` + `files.pythonhosted.org` for `snet-appsvc` (done in Bicep), or build in CI.
+- **App returns 5xx after a failed deploy**: the on-server build broke the running app. Fix the cause and redeploy. `deploy_app.sh` now fails loudly if `/healthz/deps` isn't 200 after the deploy.
+- **New route returns 404 after a successful deploy**: the old process kept running (seen twice). `deploy_app.sh` now restarts the app after every deployment.
+- **Firewall log tables (`AZFWApplicationRule`, `AZFWNetworkRule`) are empty**: the first rows take 10–20 minutes after enabling diagnostics. Use the firewall metrics (`ApplicationRuleHit`, `NetworkRuleHit`, split by `Status`) for near-real-time numbers.
+- **Redeploying silently reopened public access**: only possible before `lockDown` defaulted to `true`. Check with `az search service show … --query publicNetworkAccess`.
 - **`/healthz/deps` shows `private_ip: false` from App Service**: the private DNS zone isn't linked to the VNet, or outbound routing isn't on.
 - **Capability host provisioning fails**: roles must be in place *before* it's created (Cosmos DB Operator, Storage Blob Data Contributor/Owner, Search roles on the project identity). The Cosmos *data* role can only be granted *after* (it's scoped to `enterprise_memory`, which provisioning creates).
 - **Web app returns 502 "assistant is unavailable"**: check App Insights → Failures, or `az webapp log tail`. A common cause after a fresh deploy is the web app's Foundry User role not having propagated yet.
 
 ## Cleanup
 
-Stop the hourly cost but keep Foundry (your agents and conversations):
+Stop the firewall's hourly cost. **Order matters**, and **`deployFirewall=false` alone does NOT delete
+the firewall**: deployments are incremental, so undeclared resources are left in place (and keep billing).
+
+```bash
+# 1. Empty the route table first, so the subnets stop sending traffic to the firewall (egress goes direct).
+az deployment group create -g rg-basic-chatbot -f infra/main.bicep \
+  -p userPrincipalId=$(az ad signed-in-user show --query id -o tsv) deployFirewall=false
+# 2. Then delete the firewall and its public IPs (the free firewall policy stays and is reused).
+az network firewall delete -g rg-basic-chatbot -n afw-chatbot-<suffix>
+az network public-ip delete -g rg-basic-chatbot -n pip-fw-<suffix>
+az network public-ip delete -g rg-basic-chatbot -n pip-fw-mgmt-<suffix>
+# Bring it back later: redeploy with the default deployFirewall=true (~10 min).
+```
+
+While the firewall is off, **egress from the agent and app subnets is unrestricted**.
+
+Stop the other hourly costs but keep Foundry (your agents and conversations):
 
 ```bash
 az search service delete -g rg-basic-chatbot -n <searchServiceName> --yes

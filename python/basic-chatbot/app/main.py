@@ -23,6 +23,7 @@ import logging
 import os
 import re
 import socket
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,6 +35,7 @@ if os.getenv("APPLICATIONINSIGHTS_CONNECTION_STRING"):
 
     configure_azure_monitor(logger_name="chatbot")
 
+import httpx
 from agent_framework.foundry import FoundryAgent
 from azure.ai.projects.aio import AIProjectClient
 from azure.cosmos.aio import CosmosClient
@@ -290,6 +292,30 @@ async def healthz_deps():
     }
     healthy = all(c["ok"] for c in checks.values())
     return JSONResponse(checks, status_code=200 if healthy else 503)
+
+
+# Step 6a experiment: a FIXED outbound target (never user-supplied, so this can't be abused to make
+# the app call arbitrary URLs). The firewall decides whether the app subnet may reach it.
+EGRESS_TEST_URL = "https://example.com/"
+
+
+@app.get("/healthz/egress")
+async def healthz_egress():
+    """Can the app reach a public website through the firewall? Excluded from sign-in (Bicep).
+
+    Blocked by the firewall → the TLS handshake is reset → reachable: false.
+    Allowed (experimentAllowedFqdns) → reachable: true with the HTTP status.
+    """
+    started = time.perf_counter()
+    result = {"target": EGRESS_TEST_URL, "reachable": False, "status": None}
+    try:
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=False) as client:
+            response = await client.get(EGRESS_TEST_URL)
+        result.update(reachable=True, status=response.status_code)
+    except httpx.HTTPError as exc:
+        result["error"] = type(exc).__name__  # e.g. ConnectError: the firewall reset the connection
+    result["elapsed_ms"] = round((time.perf_counter() - started) * 1000)
+    return result
 
 
 @app.get("/healthz")

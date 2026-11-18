@@ -8,11 +8,12 @@
 // Step 3b, Entra ID sign-in on the web app (keyless: federated credential, no client secret).
 // Step 4, standard agent setup (agent state in our Cosmos DB / Storage / Search).
 // Step 5, private networking: VNet, private endpoints + DNS, agent network injection, public access off.
+// Step 6a, egress control: Azure Firewall (Basic) + route table; only allow-listed destinations get out.
 //
 // We use the *basic* agent setup here, so conversation state is kept in Microsoft-managed
 // storage. Step 4 replaces it with your own Cosmos DB / Storage / AI Search ("standard setup").
 //
-// Deliberately NOT here yet: App Gateway + WAF, Azure Firewall (step 6), Bastion/jump box (step 7).
+// Deliberately NOT here yet: App Gateway + WAF and NSGs (step 6b), Bastion/jump box (step 7).
 // Two layers now: identity (Entra ID + RBAC, no API keys) AND network (private endpoints).
 
 targetScope = 'resourceGroup'
@@ -45,13 +46,22 @@ param modelSkuName string = 'GlobalStandard'
 param modelCapacity int = 50
 
 @description('Step 5, phase B. false: everything is reachable publicly AND privately (build + migrate). true: public network access is disabled on Foundry, Search, both Cosmos DB accounts and Storage; only the web app stays public.')
-param lockDown bool = false
+// Default true (since step 6): a plain redeploy must never silently reopen public access.
+param lockDown bool = true
 
 @description('Address space of the workload VNet. Must be RFC 1918, not overlap peered networks, and not 192.168.0.0/24 for private endpoints (Foundry hosted-agent sandbox range).')
 param vnetAddressPrefix string = '10.20.0.0/16'
 param agentSubnetPrefix string = '10.20.0.0/24' // Foundry agent runtime. /27 minimum, /24 recommended.
 param privateEndpointSubnetPrefix string = '10.20.1.0/24'
 param appServiceSubnetPrefix string = '10.20.2.0/26' // App Service VNet integration. /26 recommended.
+param firewallSubnetPrefix string = '10.20.3.0/26' // name fixed by Azure: AzureFirewallSubnet, /26 minimum
+param firewallManagementSubnetPrefix string = '10.20.3.64/26' // AzureFirewallManagementSubnet, required by the Basic tier
+
+@description('Step 6a. true: deploy Azure Firewall (Basic, ~$0.40/h) and route all internet-bound traffic from the agent and app subnets through it. false: empty the route table (direct, unrestricted egress). NOTE: false does not delete an existing firewall (incremental deployment); delete it separately to stop billing (README → Cleanup).')
+param deployFirewall bool = true
+
+@description('Step 6a experiment: extra websites the APP subnet may reach through the firewall, e.g. ["example.com"]. Empty = only the platform allow-list.')
+param experimentAllowedFqdns array = []
 
 var suffix = uniqueString(resourceGroup().id)
 // Step 5: a NEW Foundry resource. Network injection (the agent subnet) has to be part of the account
@@ -773,7 +783,7 @@ resource webAppAuth 'Microsoft.Web/sites/config@2024-11-01' = {
       unauthenticatedClientAction: 'RedirectToLoginPage'
       redirectToProvider: 'azureactivedirectory'
       // /healthz: App Service health checks arrive without a user. /healthz/deps: step 5 private-path check (booleans only).
-      excludedPaths: ['/healthz', '/healthz/deps']
+      excludedPaths: ['/healthz', '/healthz/deps', '/healthz/egress'] // egress: step 6a firewall experiment (fixed target)
     }
     httpSettings: {
       requireHttps: true
@@ -819,9 +829,10 @@ resource vnet 'Microsoft.Network/virtualNetworks@2024-05-01' = {
         properties: {
           addressPrefix: agentSubnetPrefix
           delegations: [{ name: 'foundry-agents', properties: { serviceName: 'Microsoft.App/environments' } }]
-          // New VNets default to private subnets (no internet egress). The agent still needs Entra ID
-          // and the app needs Application Insights, so egress stays open until step 6's Azure Firewall.
+          // Step 6a: internet-bound traffic goes to the firewall (route table). defaultOutboundAccess stays
+          // true only as the fallback path when deployFirewall=false (then the route table is empty).
           defaultOutboundAccess: true
+          routeTable: { id: egressRoutes.id }
         }
       }
       {
@@ -839,7 +850,16 @@ resource vnet 'Microsoft.Network/virtualNetworks@2024-05-01' = {
           addressPrefix: appServiceSubnetPrefix
           delegations: [{ name: 'app-service', properties: { serviceName: 'Microsoft.Web/serverFarms' } }]
           defaultOutboundAccess: true
+          routeTable: { id: egressRoutes.id }
         }
+      }
+      {
+        name: 'AzureFirewallSubnet' // exact name required by Azure Firewall
+        properties: { addressPrefix: firewallSubnetPrefix }
+      }
+      {
+        name: 'AzureFirewallManagementSubnet' // exact name; Basic tier keeps its management traffic here
+        properties: { addressPrefix: firewallManagementSubnetPrefix }
       }
     ]
   }
@@ -847,6 +867,203 @@ resource vnet 'Microsoft.Network/virtualNetworks@2024-05-01' = {
   resource agentSubnet 'subnets' existing = { name: 'snet-agent' }
   resource privateEndpointSubnet 'subnets' existing = { name: 'snet-pe' }
   resource appServiceSubnet 'subnets' existing = { name: 'snet-appsvc' }
+  resource firewallSubnet 'subnets' existing = { name: 'AzureFirewallSubnet' }
+  resource firewallManagementSubnet 'subnets' existing = { name: 'AzureFirewallManagementSubnet' }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Step 6a: egress control (the "Azure Firewall" box, diagram ⑤)
+// Everything leaving snet-agent / snet-appsvc for the internet is routed to the firewall, which
+// allows only listed destinations and DENIES the rest (that's the default). Private-endpoint traffic
+// (10.20.x) never goes there: the VNet's own routes are more specific than 0.0.0.0/0.
+// ---------------------------------------------------------------------------------------------
+
+// The firewall's private IP is the first usable address in AzureFirewallSubnet (Azure reserves .0–.3).
+// Computed instead of read from the firewall to avoid a dependency cycle (VNet → routes → firewall → VNet).
+var firewallPrivateIp = cidrHost(firewallSubnetPrefix, 3)
+// Entra ID sign-in host for this cloud (login.microsoftonline.com in public Azure).
+var entraLoginHost = replace(replace(environment().authentication.loginEndpoint, 'https://', ''), '/', '')
+
+resource egressRoutes 'Microsoft.Network/routeTables@2024-05-01' = {
+  name: 'rt-egress-${suffix}'
+  location: location
+  properties: {
+    // false: Azure won't add routes learned from gateways, so 0.0.0.0/0 really means "the firewall".
+    disableBgpRoutePropagation: true
+    routes: deployFirewall
+      ? [
+          {
+            name: 'internet-via-firewall'
+            properties: { addressPrefix: '0.0.0.0/0', nextHopType: 'VirtualAppliance', nextHopIpAddress: firewallPrivateIp }
+          }
+        ]
+      : []
+  }
+}
+
+resource firewallPublicIp 'Microsoft.Network/publicIPAddresses@2024-05-01' = if (deployFirewall) {
+  name: 'pip-fw-${suffix}'
+  location: location
+  sku: { name: 'Standard' }
+  properties: { publicIPAllocationMethod: 'Static' }
+}
+
+resource firewallManagementPublicIp 'Microsoft.Network/publicIPAddresses@2024-05-01' = if (deployFirewall) {
+  name: 'pip-fw-mgmt-${suffix}'
+  location: location
+  sku: { name: 'Standard' }
+  properties: { publicIPAllocationMethod: 'Static' }
+}
+
+// The policy holds the rules. Anything not matched by an Allow rule is denied.
+resource firewallPolicy 'Microsoft.Network/firewallPolicies@2024-05-01' = if (deployFirewall) {
+  name: 'afwp-${baseName}-${suffix}'
+  location: location
+  properties: {
+    sku: { tier: 'Basic' }
+  }
+
+  resource rules 'ruleCollectionGroups' = {
+    name: 'egress-allow-list'
+    properties: {
+      priority: 200
+      ruleCollections: [
+        {
+          // Network rules = L4 (IP/port). Service tags let Azure maintain the IP list for Entra ID.
+          ruleCollectionType: 'FirewallPolicyFilterRuleCollection'
+          name: 'platform-network'
+          priority: 200
+          action: { type: 'Allow' }
+          rules: [
+            {
+              ruleType: 'NetworkRule'
+              name: 'entra-id'
+              description: 'Agent runtime and app authenticate with Microsoft Entra ID (docs: AzureActiveDirectory service tag).'
+              ipProtocols: ['TCP']
+              sourceAddresses: [agentSubnetPrefix, appServiceSubnetPrefix]
+              destinationAddresses: ['AzureActiveDirectory']
+              destinationPorts: ['443']
+            }
+          ]
+        }
+        {
+          // Application rules = L7 (FQDN over HTTPS, read from the TLS SNI; no TLS inspection).
+          ruleCollectionType: 'FirewallPolicyFilterRuleCollection'
+          name: 'platform-fqdns'
+          priority: 300
+          action: { type: 'Allow' }
+          rules: [
+            {
+              ruleType: 'ApplicationRule'
+              name: 'agent-runtime'
+              description: 'Foundry agent subnet (Container Apps delegation): identity, Entra ID, container images. Source: Foundry network-isolation docs.'
+              sourceAddresses: [agentSubnetPrefix]
+              protocols: [{ protocolType: 'Https', port: 443 }]
+              targetFqdns: [
+                '*.identity.azure.net'
+                entraLoginHost
+                '*.${entraLoginHost}'
+                '*.login.microsoft.com'
+                'mcr.microsoft.com'
+                '*.data.mcr.microsoft.com'
+              ]
+            }
+            {
+              ruleType: 'ApplicationRule'
+              name: 'telemetry'
+              description: 'Application Insights ingestion for the app (OpenTelemetry) and agent traces.'
+              sourceAddresses: [agentSubnetPrefix, appServiceSubnetPrefix]
+              protocols: [{ protocolType: 'Https', port: 443 }]
+              targetFqdns: [
+                '*.in.applicationinsights.azure.com'
+                '*.livediagnostics.monitor.azure.com'
+                'settings.sdk.monitor.azure.com'
+              ]
+            }
+            {
+              ruleType: 'ApplicationRule'
+              name: 'app-sign-in'
+              description: 'App Service built-in authentication redeems sign-in codes with Entra ID.'
+              sourceAddresses: [appServiceSubnetPrefix]
+              protocols: [{ protocolType: 'Https', port: 443 }]
+              targetFqdns: [entraLoginHost, '*.login.microsoft.com', '*.identity.azure.net']
+            }
+            {
+              ruleType: 'ApplicationRule'
+              name: 'app-build-packages'
+              // Found by the deny log (2026-11-18): zip deploy runs `pip install` on the app's build
+              // container, which egresses through snet-appsvc. Blocked → "SSL: UNEXPECTED_EOF" from pip.
+              // Production alternative: build in CI and deploy a pre-built package (no egress needed),
+              // or use a private feed (e.g. Azure Artifacts) to control the supply chain.
+              description: 'Python package downloads during App Service (Oryx) builds.'
+              sourceAddresses: [appServiceSubnetPrefix]
+              protocols: [{ protocolType: 'Https', port: 443 }]
+              targetFqdns: ['pypi.org', 'files.pythonhosted.org']
+            }
+          ]
+        }
+        {
+          // Separate collection so the experiment can be added and removed without touching the platform rules.
+          // An Allow collection can't be empty, so with no FQDNs it holds a rule that matches nothing real.
+          ruleCollectionType: 'FirewallPolicyFilterRuleCollection'
+          name: 'experiment'
+          priority: 400
+          action: { type: 'Allow' }
+          rules: [
+            {
+              ruleType: 'ApplicationRule'
+              name: 'experiment-allowed-sites'
+              description: 'Websites allowed for the /healthz/egress experiment (param experimentAllowedFqdns).'
+              sourceAddresses: [appServiceSubnetPrefix]
+              protocols: [{ protocolType: 'Https', port: 443 }]
+              targetFqdns: empty(experimentAllowedFqdns) ? ['nothing-allowed.invalid'] : experimentAllowedFqdns
+            }
+          ]
+        }
+      ]
+    }
+  }
+}
+
+resource firewall 'Microsoft.Network/azureFirewalls@2024-05-01' = if (deployFirewall) {
+  name: 'afw-${baseName}-${suffix}'
+  location: location
+  properties: {
+    sku: { name: 'AZFW_VNet', tier: 'Basic' }
+    firewallPolicy: { id: firewallPolicy.id }
+    ipConfigurations: [
+      {
+        name: 'data'
+        properties: {
+          subnet: { id: vnet::firewallSubnet.id }
+          publicIPAddress: { id: firewallPublicIp.id } // allowed traffic leaves to the internet from this IP
+        }
+      }
+    ]
+    managementIpConfiguration: {
+      name: 'management'
+      properties: {
+        subnet: { id: vnet::firewallManagementSubnet.id }
+        publicIPAddress: { id: firewallManagementPublicIp.id }
+      }
+    }
+  }
+  dependsOn: [firewallPolicy::rules]
+}
+
+// Every allowed AND denied connection is logged, so the allow-list can be built from evidence.
+resource firewallLogs 'Microsoft.Insights/diagnosticSettings@2021-05-01-preview' = if (deployFirewall) {
+  name: 'to-log-analytics'
+  scope: firewall
+  properties: {
+    workspaceId: logs.id
+    logAnalyticsDestinationType: 'Dedicated' // resource-specific tables: AZFWApplicationRule, AZFWNetworkRule
+    logs: [
+      { category: 'AZFWApplicationRule', enabled: true }
+      { category: 'AZFWNetworkRule', enabled: true }
+      { category: 'AZFWFqdnResolveFailure', enabled: true }
+    ]
+  }
 }
 
 // Private DNS: inside the VNet, e.g. srch-…search.windows.net resolves (via a CNAME to
@@ -939,3 +1156,5 @@ output agentStorageName string = agentStorage.name
 output appCosmosEndpoint string = appCosmos.properties.documentEndpoint
 output vnetName string = vnet.name
 output lockedDown bool = lockDown
+output firewallDeployed bool = deployFirewall
+output firewallPrivateIp string = firewallPrivateIp
