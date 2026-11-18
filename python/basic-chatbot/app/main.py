@@ -16,13 +16,17 @@ history, and the app's own Cosmos DB holds each user's list of conversations (st
 Telemetry: OpenTelemetry → Application Insights, tagged with the user's object ID (enduser.id).
 """
 
+import asyncio
+import ipaddress
 import json
 import logging
 import os
 import re
+import socket
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlparse
 
 # Configure telemetry before importing libraries that create HTTP clients, so they get instrumented.
 if os.getenv("APPLICATIONINSIGHTS_CONNECTION_STRING"):
@@ -35,7 +39,7 @@ from azure.ai.projects.aio import AIProjectClient
 from azure.cosmos.aio import CosmosClient
 from azure.identity.aio import AzureCliCredential, ManagedIdentityCredential
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from openai import BadRequestError, NotFoundError
 from opentelemetry import trace
 from pydantic import BaseModel, Field
@@ -99,6 +103,7 @@ async def lifespan(app: FastAPI):
     # One project client per process, shared by the agent (runs) and by our conversation
     # management (create with owner metadata, look up owner on resume).
     project = AIProjectClient(endpoint=os.environ["FOUNDRY_PROJECT_ENDPOINT"], credential=credential)
+    app.state.project = project
     app.state.openai = project.get_openai_client()
     app.state.agent = FoundryAgent(
         project_client=project,
@@ -110,6 +115,7 @@ async def lifespan(app: FastAPI):
     cosmos = CosmosClient(os.environ["APP_COSMOS_ENDPOINT"], credential=credential)
     container = cosmos.get_database_client(os.getenv("APP_COSMOS_DATABASE", "chat")).get_container_client("sessions")
     app.state.sessions = SessionStore(container)
+    app.state.sessions_container = container
     yield
     await cosmos.close()
     await project.close()
@@ -245,6 +251,45 @@ async def session_messages(conversation_id: str, user: User = Depends(current_us
 @app.get("/api/me")
 async def me(user: User = Depends(current_user)) -> dict:
     return {"name": user.name}
+
+
+async def _resolves_private(url: str) -> bool:
+    """Does this hostname resolve to a private (RFC 1918) address from where the app runs?"""
+    host = urlparse(url).hostname
+    infos = await asyncio.get_running_loop().getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+    return all(ipaddress.ip_address(info[4][0]).is_private for info in infos)
+
+
+async def _check(name: str, url: str, call) -> dict:
+    result = {"private_ip": False, "ok": False}
+    try:
+        result["private_ip"] = await _resolves_private(url)
+        await call()
+        result["ok"] = True
+    except Exception:
+        log.warning("Dependency check failed: %s", name, exc_info=True)
+    return result
+
+
+@app.get("/healthz/deps")
+async def healthz_deps():
+    """Step 5 readiness check: are our dependencies reached privately, and do they answer?
+
+    Excluded from sign-in (Bicep authsettings) so the private path can be verified from outside.
+    Returns booleans only, no IPs or error details. Each check is a cheap read.
+    """
+    checks = {
+        "foundry": await _check(
+            "foundry",
+            os.environ["FOUNDRY_PROJECT_ENDPOINT"],
+            lambda: app.state.project.agents.get(os.environ["FOUNDRY_AGENT_NAME"]),
+        ),
+        "app_cosmos": await _check(
+            "app_cosmos", os.environ["APP_COSMOS_ENDPOINT"], lambda: app.state.sessions_container.read()
+        ),
+    }
+    healthy = all(c["ok"] for c in checks.values())
+    return JSONResponse(checks, status_code=200 if healthy else 503)
 
 
 @app.get("/healthz")

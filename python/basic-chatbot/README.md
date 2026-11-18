@@ -1,4 +1,4 @@
-# Basic chatbot (steps 1–4 of the baseline Foundry chat architecture)
+# Basic chatbot (steps 1–5 of the baseline Foundry chat architecture)
 
 **What it shows:** the core of the [baseline Microsoft Foundry chat architecture](https://learn.microsoft.com/azure/architecture/ai-ml/architecture/baseline-microsoft-foundry-chat)
 ([diagram](chatbot-architecture.jpg)), built one step at a time.
@@ -8,10 +8,11 @@
 - **Step 3b:** **Entra ID sign-in** (App Service built-in authentication, no client secret: a federated credential on a user-assigned managed identity). Only assigned users can sign in, and each conversation can only be resumed by the user who started it.
 - **Step 4:** **standard agent setup**. A new project (`proj-chatbot-std`) stores agent definitions and conversations in **our own Cosmos DB**, files in **our own Storage account**, and vector stores in our AI Search service. The old basic project (`proj-chatbot`, agents v1–v4) is kept for comparison.
 - **Step 4b:** **"Your chats" sidebar**. The app keeps its *own* index of each user's conversations (title, timestamps) in a **separate** serverless Cosmos account, partitioned by user. Reopening a chat loads its messages through Foundry's API.
+- **Step 5:** **private networking**. A VNet with private endpoints and private DNS for Foundry, AI Search, both Cosmos DB accounts and Storage; the agent runs **inside** the VNet (network injection); the web app's outbound traffic goes through the VNet. **Public network access is disabled on everything except the web app.** This required a new Foundry resource; the step 1–4 one was deleted and purged.
 
 Why it's built this way, and what we observed: [STACK.md](STACK.md).
 
-> Status: steps 1–4 deployed and verified on 2026-11-15/17 (resource group `rg-basic-chatbot`, Sweden Central).
+> Status: steps 1–5 deployed and verified on 2026-11-15/18 (resource group `rg-basic-chatbot`, Sweden Central).
 > Web app: `https://app-chatbot-5gq6mtdeqpdcw.azurewebsites.net`. **Entra sign-in is required, and only assigned users get in.**
 > **Hourly billing while it exists:** AI Search Basic ~$0.11/h + App Service B1 ~$0.018/h. See [Cleanup](#cleanup).
 
@@ -36,6 +37,9 @@ Defined in [`infra/main.bicep`](infra/main.bicep), region Sweden Central:
 | **Storage account** (Standard_LRS, no shared keys) for agent files | 4 | per GB, ~$0 |
 | Project connections `cosmos`, `agent-storage`, `search-std`, `appinsights-std` | 4 | none |
 | **App Cosmos DB** `cosmos-chatbot-app-…` (serverless): database `chat`, container `sessions` partitioned by `/user_oid` | 4b | per request, ~$0 idle |
+| **VNet** `10.20.0.0/16`: `snet-agent` (/24, delegated to `Microsoft.App/environments`), `snet-pe` (/24), `snet-appsvc` (/26, delegated to `Microsoft.Web/serverFarms`) | 5 | free |
+| **5 private endpoints** (Foundry, Search, Cosmos ×2, Storage blob) + **6 private DNS zones** linked to the VNet | 5 | ~$36 + ~$3 / month |
+| **Foundry resource `fdy-chatbot-vnet-…`** with network injection into `snet-agent`; replaces the step 1–4 resource | 5 | none at idle |
 
 Role assignments (all keyless):
 
@@ -56,14 +60,32 @@ Role assignments (all keyless):
 | You | Cosmos DB Built-in Data Reader | `enterprise_memory` | `inspect_cosmos.py`: look at your own conversation data |
 | Web app identity, you | Cosmos DB Built-in Data Contributor | app Cosmos, database `chat` | read/write the sessions list (you: for running the app locally) |
 
+## Access after step 5 (read this first)
+
+Only the **web app** is reachable from the internet. Foundry, Search, both Cosmos DB accounts and Storage
+refuse public calls, **even with a valid token** (403 / Forbidden). From your laptop, `create_agent.py`,
+`ingest.py`, `search.py`, `evaluate.py`, `inspect_cosmos.py`, `chat.py`, Data Explorer and the Foundry
+portal's agent pages no longer work. That's the point. Private developer access (Bastion + jump box) is step 7.
+To work from a laptop temporarily, redeploy with `-p lockDown=false`, then redeploy with `lockDown=true`.
+
+Verify the private path without signing in:
+
+```bash
+curl https://<webAppName>.azurewebsites.net/healthz/deps
+# {"foundry":{"private_ip":true,"ok":true},"app_cosmos":{"private_ip":true,"ok":true}}
+```
+
 ## Deploy
 
 ```bash
 az login
 az group create -n rg-basic-chatbot -l swedencentral
 az deployment group create -g rg-basic-chatbot -f infra/main.bicep \
-  -p userPrincipalId=$(az ad signed-in-user show --query id -o tsv) \
+  -p userPrincipalId=$(az ad signed-in-user show --query id -o tsv) lockDown=false \
   --query properties.outputs
+# …create the agent, ingest, deploy the app and test (everything below), then lock down:
+az deployment group create -g rg-basic-chatbot -f infra/main.bicep \
+  -p userPrincipalId=$(az ad signed-in-user show --query id -o tsv) lockDown=true
 cp .env.example .env   # fill in FOUNDRY_PROJECT_ENDPOINT and SEARCH_ENDPOINT from the outputs
 uv sync
 ```
@@ -258,6 +280,29 @@ In the web UI each answer shows its searches, citations, agent version and token
 **16. Why can't we "switch" the old project to standard?**
 - *Explain:* capability hosts are immutable, and a project's storage can't be changed after creation. Moving means a new project, recreating agents from source (that's why `create_agent.py` exists), and accepting that old conversations stay behind. Treat agent definitions as code from day one.
 
+### Step 5
+
+**18. Two locks: is a valid token enough?**
+- *Predict:* with public access disabled, does a request with a valid Entra token and the right role still work from your laptop?
+- *Change:* `curl -H "Authorization: Bearer $(az account get-access-token --scope https://search.azure.com/.default --query accessToken -o tsv)" "https://<search>.search.windows.net/indexes/policies/docs?api-version=2025-09-01&search=hotel"`
+- *Observe (2026-11-17):* `403` from Foundry and Search, `Forbidden` from Cosmos DB, while `/healthz/deps` (from inside App Service) reports all dependencies reachable.
+- *Explain:* network and identity are independent layers and a request must pass both. A leaked token no longer works from the internet.
+
+**19. The same hostname, two answers (private DNS)**
+- *Predict:* the app still calls `fdy-…services.ai.azure.com`. How does it end up at a private IP?
+- *Observe:* `az network private-dns record-set a list -g rg-basic-chatbot -z privatelink.search.windows.net` shows `10.20.1.9`. From your laptop, `nslookup <search>.search.windows.net` shows a CNAME to `…privatelink.search.windows.net` and a **public** IP. `/healthz/deps` reports `private_ip: true` from inside.
+- *Explain:* the public name CNAMEs to a `privatelink` name. Inside the VNet a linked private DNS zone answers with the private endpoint's IP, and outside, public DNS answers. No code or connection string changed. DNS mistakes are the #1 private-networking failure.
+
+**20. Inbound vs outbound**
+- *Explain:* private endpoints secure **inbound** (who can reach a service). VNet integration (App Service) and network injection (Foundry agent) secure **outbound** (how a component reaches others). The web app's *inbound* is still public; step 6's App Gateway + WAF changes that.
+
+**21. The one hop without a private endpoint**
+- *Observe (2026-11-18):* after lockdown, App Insights shows `execute_tool remote_functions.azure_ai_search` succeeding. The tool uses vector search, so Search reached Foundry's embedding model.
+- *Explain:* Search Basic can't use a shared private link to Foundry, so Foundry keeps `networkAcls.bypass: AzureServices` (trusted Azure services, authenticated by managed identity + RBAC). Narrower than public, broader than private. Search S1+ with a shared private link would close it.
+
+**22. What's still open: egress**
+- *Explain:* `snet-agent` and `snet-appsvc` have default outbound internet access (the agent needs Entra ID, the app needs App Insights). A compromised component could still send data to any internet address. Step 6's Azure Firewall (route table `0.0.0.0/0 → firewall`, FQDN allow-list) closes it.
+
 ## Troubleshooting
 
 - **`tool_user_error` (400) from a grounded agent**: the *project* identity lacks roles on Search (see the RBAC table), or a new role hasn't propagated yet.
@@ -272,6 +317,13 @@ In the web UI each answer shows its searches, citations, agent version and token
 - **"Your sign-in has expired" in the UI**: App Service redirected an API call to Entra. Reload the page.
 - **`Connection <name> already exist, and can only be updated by the workspace that created it`**: connection names are unique across the whole Foundry **account**, not per project. Give the new project's connections different names (`search-std`, …).
 - **`Foundry Account capabilityHost Not Found`**: a project capability host needs an account-level one first (`capabilityHostKind: Agents`, no connections).
+- **`There is an existing Capability Host with name: <account>@aml_aiagentservice`**: a network-injected Foundry resource creates its own account capability host (with `customerSubnet`). Don't declare another one.
+- **`Resource name is invalid … alphanumeric characters, dashes, and underscores`** on the account capability host: the platform's name contains `@`, so you can't PUT it yourself. Leave it to the platform.
+- **`Account … in state Accepted`**: connecting the Foundry private endpoint updates the account and collides with other account writes. Create the Foundry private endpoint last (`dependsOn`).
+- **The app's outbound traffic isn't routed through the VNet**: `siteConfig.vnetRouteAllEnabled` is silently ignored by `Microsoft.Web/sites@2024-11-01`. Use `properties.outboundVnetRouting.applicationTraffic: true` and check the deployed value.
+- **New app code deployed but the old code still answers**: the zip deploy succeeded, but the process wasn't restarted. Run `az webapp restart` and verify a new route.
+- **App Insights query returns nothing for older data**: `az monitor app-insights query` searches only the **last hour** unless you pass `--offset` (e.g. `--offset 2d`), whatever the query's `ago()` says.
+- **`/healthz/deps` shows `private_ip: false` from App Service**: the private DNS zone isn't linked to the VNet, or outbound routing isn't on.
 - **Capability host provisioning fails**: roles must be in place *before* it's created (Cosmos DB Operator, Storage Blob Data Contributor/Owner, Search roles on the project identity). The Cosmos *data* role can only be granted *after* (it's scoped to `enterprise_memory`, which provisioning creates).
 - **Web app returns 502 "assistant is unavailable"**: check App Insights → Failures, or `az webapp log tail`. A common cause after a fresh deploy is the web app's Foundry User role not having propagated yet.
 
@@ -288,6 +340,10 @@ az appservice plan delete -g rg-basic-chatbot -n <appServicePlanName> --yes   # 
 Remove everything:
 
 ```bash
+# A Foundry resource with projects can't be deleted directly ("nested resources exist"). Order:
+#   project capability host → projects → account (its capability host goes with it) → purge.
+# Delete AND purge a network-injected Foundry resource BEFORE deleting the VNet, or the agent
+# subnet stays locked by a service association link.
 az group delete -n rg-basic-chatbot --yes
 az cognitiveservices account purge -g rg-basic-chatbot -l swedencentral -n <foundryAccountName>
 # The Entra app registration lives in the tenant, not the resource group. Delete it separately:

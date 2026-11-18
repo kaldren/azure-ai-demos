@@ -1,4 +1,4 @@
-# STACK: basic chatbot, steps 1–4
+# STACK: basic chatbot, steps 1–5
 
 ## Problem and scope
 
@@ -12,13 +12,16 @@
 | 3 | How does a hosted app call the agent without secrets, and can one request be traced across app and Foundry? |
 | 3b | How do end users sign in without the app holding a secret, and how do we stop one user reading another's conversation? |
 | 4 | What does it take for agent state to live in resources *we* own, and what does it cost? |
+| 5 | Can everything except the web app be unreachable from the internet, and what does that change? |
 
 **Assumptions:** a learning build, a 16-chunk synthetic corpus, public endpoints secured by Entra ID. **Decisions made:** Bicep · Agent Framework `FoundryAgent` · Sweden Central ·
 Azure AI Search tool (not Foundry IQ) · AI Search Basic with hybrid vectors · **forced retrieval
 (`tool_choice=required`, agent v4)** · FastAPI on App Service B1 · **App Service built-in auth with a
 federated credential (no secret), assigned users only, ownership in conversation metadata** ·
 **standard setup in a new project via capability hosts (GA, as in the baseline repo), serverless Cosmos DB,
-search service shared between knowledge and agent vector store (deviation), old project kept**.
+search service shared between knowledge and agent vector store (deviation)** · **step 5: VNet + private endpoints +
+private DNS, network-injected agent in a NEW Foundry resource (old one deleted), public access off everywhere
+except the web app, no IP exceptions, Search→Foundry via the trusted-services exception**.
 
 ## How it works
 
@@ -53,6 +56,31 @@ flowchart LR
 5. The app extracts the search queries and citation titles from the raw response and returns them to the UI.
 6. Telemetry: the app sends `chat-web` spans with OpenTelemetry. Foundry sends `responsesapi` spans (e.g. `invoke_agent basic-chatbot:4`) through the project's App Insights connection.
 
+### Network (step 5)
+
+```
+                     Internet
+                        │ HTTPS (inbound still public; step 6: App Gateway + WAF)
+                        ▼
+              App Service (web app) ── outbound via VNet integration (route all)
+                        │
+VNet 10.20.0.0/16 ──────┼────────────────────────────────────────────────────────────
+  snet-appsvc 10.20.2.0/26 (delegated: Microsoft.Web/serverFarms)
+                        │
+  snet-pe 10.20.1.0/24  ▼
+     10.20.1.12 ─Private Link─▶ Foundry (fdy-chatbot-vnet-…)   ◀── project, agent, models
+     10.20.1.9  ─Private Link─▶ AI Search  ◀────────────────┐
+     10.20.1.5  ─Private Link─▶ Cosmos DB (agent state)  ◀──┤
+     10.20.1.7  ─Private Link─▶ Cosmos DB (app sessions)    │ agent's calls start inside the VNet
+     10.20.1.4  ─Private Link─▶ Storage (blob)  ◀───────────┤
+  snet-agent 10.20.0.0/24 (delegated: Microsoft.App/environments)
+     Foundry agent runtime (network injection) ─────────────┘
+  6 private DNS zones (privatelink.*) linked to the VNet
+───────────────────────────────────────────────────────────────────────────────────────
+  Search ──(trusted Azure services exception, MI + RBAC)──▶ Foundry embedding model
+  Public network access: Disabled on Foundry, Search, Cosmos ×2, Storage
+```
+
 ## Why this stack
 
 | Component | Role in this demo | Why chosen | Tradeoff / alternative |
@@ -65,6 +93,12 @@ flowchart LR
 | **User-assigned identity for the project** | Runtime + provisioning identity | Exists *before* the project, so roles can be granted before provisioning | System-assigned (template 41): works, but needs careful ordering |
 | **Cosmos DB serverless** | Thread storage | ~$0 idle | Provisioned ≥3000 RU/s for predictable latency (~$175/month). Zone redundancy and continuous backup for production. |
 | **App-owned sessions index** (separate serverless Cosmos, `/user_oid` partition) | "Your chats" list and reopen | Our schema for our feature. Never depend on Foundry's internal containers. Per-user partition = isolation by construction. | Foundry has no "list conversations by owner" query, so without this the UI can't list chats |
+| **VNet + private endpoints + private DNS** (step 5) | Second security layer: no internet path to data services | Independent of identity: a leaked token or over-broad role is no longer usable from the internet | Network security perimeter (preview); IP allow-lists (rejected: user wanted no IP exceptions) |
+| **Network injection** (agent subnet) | Agent's outbound calls start inside our VNet | Required for private Search/Cosmos/Storage with Foundry Agent Service | Microsoft-managed network (less control); not possible on an existing account |
+| **New Foundry resource** for step 5 | Network injection must exist from creation | No supported way to add it to the step 1–4 account | n/a. Decide on networking before the first production agent. |
+| **Two-phase rollout** (`lockDown` param) | Build and migrate with public access on, then close it | Lets local tools finish setup (agent, index) before we lose access | Build from inside the VNet (jump box/CI runner, step 7) |
+| **Trusted-services exception for Search → Foundry** | Vectorizer reaches the embedding model | Search Basic can't do a shared private link to Foundry; Microsoft's own private Foundry IQ tutorial relies on this bypass | Search S1 (~$245/month) with a shared private link; or non-vector query types |
+| **Default outbound access on agent/app subnets** | Egress to Entra ID and App Insights | New subnets are private by default | NAT Gateway, or Azure Firewall with FQDN rules (step 6) |
 | **One search service for knowledge *and* agent vectors** | Cost saving | ~$80/month less | **Deviation:** the baseline uses a dedicated one, so a compromise of one use doesn't expose the other. Split before production. |
 | **gpt-5.4-mini**, 50K TPM | Generation + tool use | Agent-supported, cheap. 10K TPM caused 429s with grounding. | Larger models: maybe fewer skipped searches under `auto` (untested) |
 | **Azure AI Search tool** | Single-index retrieval | In the reference, and transparent | Foundry IQ for multi-source agentic retrieval |
@@ -131,6 +165,19 @@ conversation ID, and is absent across `/new`. Input tokens grow every turn.
 | Same quality, more latency | `evaluate.py`: 10/10 correct, ~1.2K input tokens like v4. 2.8–4.4 s vs 2.1–2.5 s in basic (n=2). | Likely our serverless Cosmos in the path. Confirm with spans before tuning. |
 | Cutover is a new agent + a config change | `create_agent.py` recreated the agent (v1) in the new project. The web app's settings moved to `proj-chatbot-std` / v1. Old browser sessions get a 404 and start fresh. | Agent definitions as code made this a non-event |
 
+**Step 5 (2026-11-17/18):**
+
+| Observation | Evidence | Implication |
+|---|---|---|
+| **Network and identity are independent locks** | After lockdown, from the internet **with valid tokens**: Foundry 403, Search 403, Cosmos `Forbidden`. From App Service: `/healthz/deps` → `private_ip: true, ok: true` for Foundry and app Cosmos. | A stolen token is useless from the internet |
+| **Full chat path works privately** | 2 web chats after lockdown. App Insights: `invoke_agent basic-chatbot:1` → `execute_tool remote_functions.azure_ai_search` (365 / 1478 ms, success) → `chat gpt-5.4-mini`. | The agent (in `snet-agent`) reaches Search and Cosmos via private endpoints. Search reaches Foundry via the trusted-services exception. |
+| **DNS does the routing** | Private zones hold A records `10.20.1.4–.12`. Cosmos gets 2 records per account (global + regional endpoint). | No code changes: same hostnames, different answers inside vs outside |
+| **A network-injected account creates its own account capability host** | `<account>@aml_aiagentservice` with `customerSubnet` = `snet-agent`, created by the platform. Declaring `agents` → conflict. Declaring the platform name → `Resource name is invalid` (`@`). | Don't declare it (the baseline repo doesn't). foundry-samples #15's default name no longer deploys. |
+| **Private endpoint + account writes collide** | `Account … in state Accepted` twice. Fixed by creating the Foundry private endpoint last. | Order account-touching resources explicitly |
+| **A setting silently ignored** | `siteConfig.vnetRouteAllEnabled: true` → deployed value `false`. `outboundVnetRouting.applicationTraffic: true` worked. | Verify deployed state, not deployment success |
+| **A deployed build not running** | `/healthz/deps` was 404 although the deployed archive contained it. `az webapp restart` fixed it. | Check a new route or version after deploys |
+| **Retiring a Foundry resource has an order** | `CannotDeleteResource … nested resources exist` → delete project capability host → projects → account capability host → account → purge | Script teardown. The old identities' role assignments were removed first (0 orphans left). |
+
 Small samples on one model: treat these as observations, not guarantees.
 
 ## When to propose it
@@ -139,8 +186,10 @@ Small samples on one model: treat these as observations, not guarantees.
 from a web app with no secrets in config, plus server- and client-side traces for debugging.
 Users sign in with Entra ID, only assigned users get in, and each user can only resume their own conversations.
 Agent state now lives in resources you own (Cosmos DB, Storage, Search).
-**Main adoption risks:** (1) everything still has **public endpoints**, protected by identity only (step 5);
-(2) retrieval quality is only checked by a 5-question keyword eval. **Next validation:** a larger eval set, and
+Data services are reachable only from inside the VNet.
+**Main adoption risks:** (1) **egress is uncontrolled**: a compromised agent or app can reach any internet
+address (step 6: Azure Firewall); (2) the web app's inbound has no WAF (step 6); (3) operators have no
+private access path (step 7: Bastion + jump box); (4) retrieval quality is checked by a 5-question eval. **Next validation:** a larger eval set, and
 assignment via a security group rather than individual users.
 
 ## Beyond the demo (gaps that matter here)
@@ -148,7 +197,9 @@ assignment via a security group rather than individual users.
 - The **user's identity isn't passed to Foundry**. The app calls as itself, so Foundry-side audit and Purview see the app, not the person (the baseline calls this out).
 - Anyone with *Foundry User* on the project can still read every conversation through the API, and anyone with Cosmos data roles can read them directly. Keep both role lists short.
 - One search service serves both knowledge and agent vectors (deviation from the baseline). Cosmos DB has no zone redundancy or continuous backup.
-- Public endpoints on App Service, Foundry and Search (steps 5–6: private endpoints, App Gateway + WAF).
+- App Service inbound is public without a WAF (step 6). Outbound internet from `snet-agent`/`snet-appsvc` is unrestricted (step 6 firewall).
+- Search → Foundry uses the trusted-services exception, not a private endpoint (needs Search S1+). No NSGs on subnets yet.
+- No private operator access: setup changes need `lockDown=false` temporarily (step 7 jump box/CI runner).
 - Single B1 instance, no zone redundancy (the diagram shows 3 zones).
 - *Search Service Contributor* on the project MI is over-privileged. App Insights ingestion uses a connection string, not Entra.
 - The eval set is tiny and keyword-based.

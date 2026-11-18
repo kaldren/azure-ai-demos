@@ -6,12 +6,14 @@
 // an embedding model, and a project connection so the agent can use the AI Search tool.
 // Step 3, chat UI on App Service (managed identity) + Application Insights.
 // Step 3b, Entra ID sign-in on the web app (keyless: federated credential, no client secret).
+// Step 4, standard agent setup (agent state in our Cosmos DB / Storage / Search).
+// Step 5, private networking: VNet, private endpoints + DNS, agent network injection, public access off.
 //
 // We use the *basic* agent setup here, so conversation state is kept in Microsoft-managed
 // storage. Step 4 replaces it with your own Cosmos DB / Storage / AI Search ("standard setup").
 //
-// Deliberately NOT here yet: VNet, private endpoints, App Gateway, Firewall.
-// Service-to-service access is secured by identity only (Entra ID + RBAC, no API keys).
+// Deliberately NOT here yet: App Gateway + WAF, Azure Firewall (step 6), Bastion/jump box (step 7).
+// Two layers now: identity (Entra ID + RBAC, no API keys) AND network (private endpoints).
 
 targetScope = 'resourceGroup'
 
@@ -42,16 +44,28 @@ param modelSkuName string = 'GlobalStandard'
 @description('Rate limit in thousands of tokens per minute. It is a throttle, not a reservation, so it costs nothing until used. 10 was too low once search results were added to the prompt (429s in step 2).')
 param modelCapacity int = 50
 
+@description('Step 5, phase B. false: everything is reachable publicly AND privately (build + migrate). true: public network access is disabled on Foundry, Search, both Cosmos DB accounts and Storage; only the web app stays public.')
+param lockDown bool = false
+
+@description('Address space of the workload VNet. Must be RFC 1918, not overlap peered networks, and not 192.168.0.0/24 for private endpoints (Foundry hosted-agent sandbox range).')
+param vnetAddressPrefix string = '10.20.0.0/16'
+param agentSubnetPrefix string = '10.20.0.0/24' // Foundry agent runtime. /27 minimum, /24 recommended.
+param privateEndpointSubnetPrefix string = '10.20.1.0/24'
+param appServiceSubnetPrefix string = '10.20.2.0/26' // App Service VNet integration. /26 recommended.
+
 var suffix = uniqueString(resourceGroup().id)
-var accountName = 'fdy-${baseName}-${suffix}'
-var projectName = 'proj-${baseName}'
+// Step 5: a NEW Foundry resource. Network injection (the agent subnet) has to be part of the account
+// from the start; the step 1–4 account (fdy-chatbot-<suffix>) is deleted after cutover.
+var accountName = 'fdy-${baseName}-vnet-${suffix}'
+var publicAccess = lockDown ? 'Disabled' : 'Enabled'
 
 // "Foundry User" (formerly "Azure AI User"): lets a principal use the data plane, i.e. create
 // agents and call them. It does NOT grant permission to manage the resource itself.
 var foundryUserRoleId = '53ca6127-db72-4b80-b1b0-d745d6d5456d'
 
 // The Foundry resource ("Microsoft Foundry resource" box in the diagram).
-// This is the security and networking boundary: private endpoints attach here in step 5.
+// This is the security and networking boundary: inbound through its private endpoint, outbound
+// (agents calling Search/Cosmos/Storage) from inside our VNet through network injection.
 resource account 'Microsoft.CognitiveServices/accounts@2026-05-01' = {
   name: accountName
   location: location
@@ -66,23 +80,25 @@ resource account 'Microsoft.CognitiveServices/accounts@2026-05-01' = {
     allowProjectManagement: true // Required for Foundry projects (and therefore agents)
     customSubDomainName: accountName // Required for Entra ID token auth
     disableLocalAuth: true // No API keys. Identity is the only way in.
-    publicNetworkAccess: 'Enabled' // Step 5 switches this to 'Disabled' and adds a private endpoint
-  }
-}
-
-// The Foundry project ("Microsoft Foundry project" box in the diagram).
-// It is the unit of isolation for agents, conversations and connections. It has its own
-// managed identity, which the agent uses to reach tools such as AI Search in step 2.
-resource project 'Microsoft.CognitiveServices/accounts/projects@2026-05-01' = {
-  parent: account
-  name: projectName
-  location: location
-  identity: {
-    type: 'SystemAssigned'
-  }
-  properties: {
-    displayName: 'Basic chatbot'
-    description: 'Learning build of the baseline Foundry chat reference architecture'
+    publicNetworkAccess: publicAccess
+    networkAcls: {
+      defaultAction: lockDown ? 'Deny' : 'Allow'
+      ipRules: [] // no IP exceptions (decision 2026-11-17): only the web app is public
+      virtualNetworkRules: []
+      // "Trusted Azure services" exception. AI Search's vectorizer calls the embedding model here as
+      // its managed identity; Search Basic can't use a shared private link to Foundry, and Microsoft's
+      // own private Foundry IQ tutorial relies on this bypass. Same setting as foundry-samples #15.
+      bypass: 'AzureServices'
+    }
+    // Agents run inside OUR subnet, so their calls to Search, Cosmos DB and Storage use private endpoints.
+    #disable-next-line BCP037
+    networkInjections: [
+      {
+        scenario: 'agent'
+        subnetArmId: vnet::agentSubnet.id
+        useMicrosoftManagedNetwork: false
+      }
+    ]
   }
 }
 
@@ -101,8 +117,6 @@ resource modelDeployment 'Microsoft.CognitiveServices/accounts/deployments@2026-
       version: modelVersion
     }
   }
-  // Serialize child operations on the account: concurrent project + deployment writes can conflict.
-  dependsOn: [project]
 }
 
 // You play the role that App Service's managed identity takes on in step 3.
@@ -129,7 +143,6 @@ param embeddingModelVersion string = '1'
 param searchSku string = 'basic'
 
 var searchName = 'srch-${baseName}-${suffix}'
-var searchConnectionName = 'search'
 
 // Built-in role IDs (verified with `az role definition list --name ...`)
 var roles = {
@@ -171,7 +184,7 @@ resource search 'Microsoft.Search/searchServices@2025-05-01' = {
     partitionCount: 1
     disableLocalAuth: true // keyless, like Foundry: every caller needs an Entra token plus a role
     semanticSearch: 'free' // semantic ranker on the free monthly allowance. Errors instead of billing when it runs out.
-    publicNetworkAccess: 'enabled' // step 5 adds a private endpoint and disables this
+    publicNetworkAccess: lockDown ? 'disabled' : 'enabled' // the agent reaches it through its private endpoint
   }
 }
 
@@ -187,33 +200,6 @@ resource searchCallsEmbeddings 'Microsoft.Authorization/roleAssignments@2022-04-
   }
 }
 
-// Agent → Search: the AI Search tool calls Search as the *project's* managed identity.
-// Observed on 2026-11-16. The tool doc says to grant roles to the Foundry *account* identity
-// (https://learn.microsoft.com/azure/foundry/agents/how-to/tools/ai-search#setup), but:
-//   - project MI with Search Index Data Reader only     → 400 tool_user_error
-//   - + Search Service Contributor on the project MI    → works (it seems to read the index schema)
-//   - account MI roles removed                          → still works
-// Search Service Contributor is broader than needed (it can also delete indexes). That's a
-// least-privilege gap to close with a custom role later.
-resource projectSearchService 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  scope: search
-  name: guid(search.id, project.id, roles.searchServiceContributor)
-  properties: {
-    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roles.searchServiceContributor)
-    principalId: project.identity.principalId
-    principalType: 'ServicePrincipal'
-  }
-}
-
-resource projectSearchData 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  scope: search
-  name: guid(search.id, project.id, roles.searchIndexDataReader)
-  properties: {
-    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roles.searchIndexDataReader)
-    principalId: project.identity.principalId
-    principalType: 'ServicePrincipal'
-  }
-}
 
 // You, running ingest.py and search.py locally: create the index, upload chunks, query.
 resource userSearchData 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
@@ -233,24 +219,6 @@ resource userSearchService 'Microsoft.Authorization/roleAssignments@2022-04-01' 
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roles.searchServiceContributor)
     principalId: userPrincipalId
     principalType: 'User'
-  }
-}
-
-// The project connection is how a prompt agent refers to an external resource. The agent
-// definition stores only the connection ID and index name, never an endpoint or a credential.
-resource searchConnection 'Microsoft.CognitiveServices/accounts/projects/connections@2026-05-01' = {
-  parent: project
-  name: searchConnectionName
-  properties: {
-    category: 'CognitiveSearch'
-    target: 'https://${search.name}.search.windows.net'
-    authType: 'AAD' // keyless: Foundry calls Search with its managed identity
-    isSharedToAll: true
-    metadata: {
-      ApiType: 'Azure'
-      ResourceId: search.id
-      location: location
-    }
   }
 }
 
@@ -316,43 +284,15 @@ resource accountAppInsightsConnection 'Microsoft.CognitiveServices/accounts/conn
   }
 }
 
-// Different name from the account connection: account-level connections are also visible in
-// the project, so reusing 'appinsights' here fails with "Connection appinsights already exist".
-resource projectAppInsightsConnection 'Microsoft.CognitiveServices/accounts/projects/connections@2026-05-01' = {
-  parent: project
-  name: 'appinsights-project'
-  properties: {
-    category: 'AppInsights'
-    target: appInsights.id
-    authType: 'ApiKey'
-    isSharedToAll: true
-    credentials: {
-      key: appInsights.properties.ConnectionString
-    }
-    metadata: {
-      ApiType: 'Azure'
-      ResourceId: appInsights.id
-    }
-  }
-  dependsOn: [searchConnection] // serialize writes on the project
-}
-
-// Who can read traces: the project identity (Foundry's portal views and evaluations) and you.
-// (The role assignment *name* must be known before deployment, so it's keyed on project.id /
-// userPrincipalId. The project's principalId only exists once the project has been created.)
+// You can read traces (the project identity gets the same roles in the step 4 section).
 resource traceReaders 'Microsoft.Authorization/roleAssignments@2022-04-01' = [
-  for r in [
-    { who: 'project', role: monitoringRoles.logAnalyticsReader }
-    { who: 'project', role: monitoringRoles.privilegedMonitoringDataReader }
-    { who: 'user', role: monitoringRoles.logAnalyticsReader }
-    { who: 'user', role: monitoringRoles.privilegedMonitoringDataReader }
-  ]: {
+  for role in [monitoringRoles.logAnalyticsReader, monitoringRoles.privilegedMonitoringDataReader]: {
     scope: appInsights
-    name: guid(appInsights.id, r.who == 'project' ? project.id : userPrincipalId, r.role)
+    name: guid(appInsights.id, userPrincipalId, role)
     properties: {
-      roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', r.role)
-      principalId: r.who == 'project' ? project.identity.principalId : userPrincipalId
-      principalType: r.who == 'project' ? 'ServicePrincipal' : 'User'
+      roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', role)
+      principalId: userPrincipalId
+      principalType: 'User'
     }
   }
 ]
@@ -386,6 +326,15 @@ resource webApp 'Microsoft.Web/sites@2024-11-01' = {
   properties: {
     serverFarmId: plan.id
     httpsOnly: true
+    // Step 5: outbound calls leave through our VNet, so Foundry and the app's Cosmos DB are reached
+    // through their private endpoints (resolved by the private DNS zones linked to the VNet).
+    // INBOUND stays public: users reach the app on its normal URL (App Gateway + WAF come in step 6).
+    virtualNetworkSubnetId: vnet::appServiceSubnet.id
+    // Route ALL of the app's outbound traffic through the VNet (not just RFC 1918 destinations).
+    // The older siteConfig.vnetRouteAllEnabled was silently ignored by this API version (observed: false).
+    outboundVnetRouting: {
+      applicationTraffic: true
+    }
     siteConfig: {
       linuxFxVersion: 'PYTHON|3.14'
       appCommandLine: 'gunicorn -w 2 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:8000 --timeout 180 main:app'
@@ -463,7 +412,7 @@ resource cosmos 'Microsoft.DocumentDB/databaseAccounts@2025-04-15' = {
     locations: [{ locationName: location, failoverPriority: 0, isZoneRedundant: false }]
     disableLocalAuth: true // keyless: Entra + Cosmos data-plane roles only
     minimalTlsVersion: 'Tls12'
-    publicNetworkAccess: 'Enabled' // step 5: private endpoint
+    publicNetworkAccess: publicAccess // reached through its private endpoint
   }
 }
 
@@ -477,7 +426,8 @@ resource agentStorage 'Microsoft.Storage/storageAccounts@2025-01-01' = {
     allowSharedKeyAccess: false // keyless
     allowBlobPublicAccess: false
     minimumTlsVersion: 'TLS1_2'
-    publicNetworkAccess: 'Enabled' // step 5: private endpoint
+    publicNetworkAccess: publicAccess // reached through its private endpoint
+    networkAcls: { defaultAction: lockDown ? 'Deny' : 'Allow', bypass: 'AzureServices' }
   }
 }
 
@@ -542,7 +492,7 @@ resource stdProject 'Microsoft.CognitiveServices/accounts/projects@2026-05-01' =
     displayName: 'Basic chatbot (standard setup)'
     description: 'Agent state in our own Cosmos DB, Storage and AI Search'
   }
-  dependsOn: [projectAppInsightsConnection, embeddingDeployment] // serialize writes on the account
+  dependsOn: [accountAppInsightsConnection, embeddingDeployment] // serialize writes on the account
 }
 
 // The project's internal ID names its Cosmos containers and blob containers. Used to scope roles.
@@ -617,18 +567,10 @@ resource stdAppInsightsConnection 'Microsoft.CognitiveServices/accounts/projects
   dependsOn: [stdSearchConnection]
 }
 
-// Account-level capability host: "this account runs Agent Service". It has no storage settings of
-// its own. Without it, the project one fails with "Foundry Account capabilityHost Not Found"
-// (pattern from foundry-samples template 41; the baseline repo doesn't need it explicitly).
-resource accountCapabilityHost 'Microsoft.CognitiveServices/accounts/capabilityHosts@2025-06-01' = {
-  parent: account
-  name: 'agents'
-  properties: {
-    #disable-next-line BCP037
-    capabilityHostKind: 'Agents'
-  }
-  dependsOn: [stdAppInsightsConnection] // after all project writes, to avoid conflicts on the account
-}
+// Account-level capability host: NOT declared here. A network-injected account creates it itself,
+// named '<account>@aml_aiagentservice' with customerSubnet = snet-agent (seen 2026-11-17). Declaring
+// one ourselves failed twice: a different name conflicts ("existing Capability Host…"), and that name
+// can't be PUT by us ("Resource name is invalid": '@'). The baseline repo doesn't declare it either.
 
 // The switch from "basic" to "standard": tells Agent Service which connections hold
 // conversations (Cosmos), files (Storage) and vector stores (Search) for this project.
@@ -644,7 +586,7 @@ resource stdCapabilityHost 'Microsoft.CognitiveServices/accounts/projects/capabi
     vectorStoreConnections: [stdSearchConnection.name]
   }
   dependsOn: [
-    accountCapabilityHost
+    stdAppInsightsConnection
     agentCosmosOperator
     agentStorageContributor
     agentStorageOwnerScoped
@@ -713,7 +655,7 @@ resource appCosmos 'Microsoft.DocumentDB/databaseAccounts@2025-04-15' = {
     locations: [{ locationName: location, failoverPriority: 0, isZoneRedundant: false }]
     disableLocalAuth: true
     minimalTlsVersion: 'Tls12'
-    publicNetworkAccess: 'Enabled' // step 5: private endpoint
+    publicNetworkAccess: publicAccess // reached through its private endpoint
   }
 
   resource database 'sqlDatabases' = {
@@ -830,7 +772,8 @@ resource webAppAuth 'Microsoft.Web/sites/config@2024-11-01' = {
       requireAuthentication: true
       unauthenticatedClientAction: 'RedirectToLoginPage'
       redirectToProvider: 'azureactivedirectory'
-      excludedPaths: ['/healthz'] // App Service health checks arrive without a user
+      // /healthz: App Service health checks arrive without a user. /healthz/deps: step 5 private-path check (booleans only).
+      excludedPaths: ['/healthz', '/healthz/deps']
     }
     httpSettings: {
       requireHttps: true
@@ -857,12 +800,135 @@ resource webAppAuth 'Microsoft.Web/sites/config@2024-11-01' = {
   dependsOn: [federatedCredential, userAppAssignment]
 }
 
+// ---------------------------------------------------------------------------------------------
+// Step 5: private networking (the "Virtual network" box and its subnets in the diagram)
+// Docs: https://learn.microsoft.com/azure/foundry/agents/how-to/virtual-networks
+// Pattern: foundry-samples 15-private-network-standard-agent-setup
+// ---------------------------------------------------------------------------------------------
+
+resource vnet 'Microsoft.Network/virtualNetworks@2024-05-01' = {
+  name: 'vnet-${baseName}-${suffix}'
+  location: location
+  properties: {
+    addressSpace: { addressPrefixes: [vnetAddressPrefix] }
+    subnets: [
+      {
+        // "Azure AI agent integration subnet": Foundry injects the agent runtime here, so the agent's
+        // calls to Search, Cosmos DB and Storage start INSIDE our network.
+        name: 'snet-agent'
+        properties: {
+          addressPrefix: agentSubnetPrefix
+          delegations: [{ name: 'foundry-agents', properties: { serviceName: 'Microsoft.App/environments' } }]
+          // New VNets default to private subnets (no internet egress). The agent still needs Entra ID
+          // and the app needs Application Insights, so egress stays open until step 6's Azure Firewall.
+          defaultOutboundAccess: true
+        }
+      }
+      {
+        // "Private endpoint subnet": one private IP per PaaS service.
+        name: 'snet-pe'
+        properties: {
+          addressPrefix: privateEndpointSubnetPrefix
+          defaultOutboundAccess: false
+        }
+      }
+      {
+        // "App Service integration subnet": the web app's OUTBOUND traffic.
+        name: 'snet-appsvc'
+        properties: {
+          addressPrefix: appServiceSubnetPrefix
+          delegations: [{ name: 'app-service', properties: { serviceName: 'Microsoft.Web/serverFarms' } }]
+          defaultOutboundAccess: true
+        }
+      }
+    ]
+  }
+
+  resource agentSubnet 'subnets' existing = { name: 'snet-agent' }
+  resource privateEndpointSubnet 'subnets' existing = { name: 'snet-pe' }
+  resource appServiceSubnet 'subnets' existing = { name: 'snet-appsvc' }
+}
+
+// Private DNS: inside the VNet, e.g. srch-…search.windows.net resolves (via a CNAME to
+// …privatelink.search.windows.net) to the private endpoint's 10.20.1.x address instead of the public IP.
+// Getting DNS right is most of the work in private networking.
+var privateDnsZoneNames = [
+  'privatelink.cognitiveservices.azure.com' // Foundry
+  'privatelink.openai.azure.com' // Foundry (OpenAI endpoint)
+  'privatelink.services.ai.azure.com' // Foundry (project / agents endpoint)
+  'privatelink.search.windows.net'
+  'privatelink.documents.azure.com' // both Cosmos DB accounts
+  'privatelink.blob.${environment().suffixes.storage}' // = privatelink.blob.core.windows.net in public Azure
+]
+
+resource dnsZones 'Microsoft.Network/privateDnsZones@2024-06-01' = [
+  for zone in privateDnsZoneNames: {
+    name: zone
+    location: 'global'
+  }
+]
+
+resource dnsZoneLinks 'Microsoft.Network/privateDnsZones/virtualNetworkLinks@2024-06-01' = [
+  for (zone, i) in privateDnsZoneNames: {
+    parent: dnsZones[i]
+    name: 'link-${vnet.name}'
+    location: 'global'
+    properties: {
+      virtualNetwork: { id: vnet.id }
+      registrationEnabled: false
+    }
+  }
+]
+
+// One private endpoint per service. `zones` = indexes into privateDnsZoneNames.
+var privateEndpoints = [
+  { name: 'foundry', resourceId: account.id, groupId: 'account', zones: [0, 1, 2] }
+  { name: 'search', resourceId: search.id, groupId: 'searchService', zones: [3] }
+  { name: 'cosmos-agent', resourceId: cosmos.id, groupId: 'Sql', zones: [4] }
+  { name: 'cosmos-app', resourceId: appCosmos.id, groupId: 'Sql', zones: [4] }
+  { name: 'storage-blob', resourceId: agentStorage.id, groupId: 'blob', zones: [5] }
+]
+
+resource privateEndpointResources 'Microsoft.Network/privateEndpoints@2024-05-01' = [
+  for pe in privateEndpoints: {
+    name: 'pe-${pe.name}-${suffix}'
+    location: location
+    // After every other write on the Foundry account: connecting a private endpoint updates the account,
+    // and concurrent account writes failed with "Account … in state Accepted".
+    dependsOn: [stdCapabilityHost, agentCosmosData]
+    properties: {
+      subnet: { id: vnet::privateEndpointSubnet.id }
+      privateLinkServiceConnections: [
+        {
+          name: pe.name
+          properties: { privateLinkServiceId: pe.resourceId, groupIds: [pe.groupId] }
+        }
+      ]
+    }
+  }
+]
+
+// Registers each endpoint's private IP in the right DNS zone(s) automatically.
+resource privateEndpointDns 'Microsoft.Network/privateEndpoints/privateDnsZoneGroups@2024-05-01' = [
+  for (pe, i) in privateEndpoints: {
+    parent: privateEndpointResources[i]
+    name: 'default'
+    properties: {
+      privateDnsZoneConfigs: [
+        for z in pe.zones: {
+          name: replace(privateDnsZoneNames[z], '.', '-')
+          properties: { privateDnsZoneId: dnsZones[z].id }
+        }
+      ]
+    }
+    dependsOn: [dnsZoneLinks]
+  }
+]
+
 output foundryAccountName string = account.name
-output projectEndpoint string = 'https://${account.name}.services.ai.azure.com/api/projects/${project.name}'
 output modelDeploymentName string = modelDeployment.name
 output embeddingDeploymentName string = embeddingDeployment.name
 output searchEndpoint string = 'https://${search.name}.search.windows.net'
-output searchConnectionName string = searchConnection.name
 output webAppName string = webApp.name
 output webAppUrl string = 'https://${webApp.properties.defaultHostName}'
 output appInsightsName string = appInsights.name
@@ -871,3 +937,5 @@ output cosmosAccountName string = cosmos.name
 output stdSearchConnectionName string = stdSearchConnection.name
 output agentStorageName string = agentStorage.name
 output appCosmosEndpoint string = appCosmos.properties.documentEndpoint
+output vnetName string = vnet.name
+output lockedDown bool = lockDown
