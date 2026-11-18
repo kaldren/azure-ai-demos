@@ -36,11 +36,15 @@ done
 # Restart explicitly so the health check below tests the code we just shipped.
 az webapp restart -g "$RG" -n "$APP" -o none
 
-URL="https://$(az webapp show -g "$RG" -n "$APP" --query defaultHostName -o tsv)"
+# Step 6b: if an Application Gateway exists, the app's own URL denies public traffic, so check health
+# THROUGH the gateway (-k: its certificate is self-signed). Otherwise check the app directly.
+AGW_FQDN="$(az network public-ip list -g "$RG" --query "[?starts_with(name,'pip-agw-')].dnsSettings.fqdn | [0]" -o tsv 2>/dev/null || true)"
+if [[ -n "$AGW_FQDN" ]]; then URL="https://$AGW_FQDN"; CURL_OPTS=(-k); else
+  URL="https://$(az webapp show -g "$RG" -n "$APP" --query defaultHostName -o tsv)"; CURL_OPTS=(); fi
 # Healthy = the app answers AND its dependencies (Foundry, app Cosmos DB) respond over the private path.
 # Added after a failed build (blocked by the firewall) left the app returning 5xx for 4.5 hours unnoticed.
 for i in $(seq 1 30); do
-  if [[ "$(curl -s -o /dev/null -w '%{http_code}' "$URL/healthz/deps")" == "200" ]]; then
+  if [[ "$(curl -s ${CURL_OPTS[@]+"${CURL_OPTS[@]}"} -o /dev/null -w '%{http_code}' "$URL/healthz/deps")" == "200" ]]; then
     echo "Done: $URL (dependencies healthy)"; exit 0
   fi
   sleep 10

@@ -1,4 +1,4 @@
-# STACK: basic chatbot, steps 1–6a
+# STACK: basic chatbot, steps 1–6b
 
 ## Problem and scope
 
@@ -14,6 +14,7 @@
 | 4 | What does it take for agent state to live in resources *we* own, and what does it cost? |
 | 5 | Can everything except the web app be unreachable from the internet, and what does that change? |
 | 6a | Can we control and audit what the agent and app send to the internet? |
+| 6b | Can there be exactly one inspected way in, and segmented subnets behind it? |
 
 **Assumptions:** a learning build, a 16-chunk synthetic corpus, public endpoints secured by Entra ID. **Decisions made:** Bicep · Agent Framework `FoundryAgent` · Sweden Central ·
 Azure AI Search tool (not Foundry IQ) · AI Search Basic with hybrid vectors · **forced retrieval
@@ -23,7 +24,9 @@ federated credential (no secret), assigned users only, ownership in conversation
 search service shared between knowledge and agent vector store (deviation)** · **step 5: VNet + private endpoints +
 private DNS, network-injected agent in a NEW Foundry resource (old one deleted), public access off everywhere
 except the web app, no IP exceptions, Search→Foundry via the trusted-services exception** · **step 6a: Azure
-Firewall Basic with an on/off switch, default-deny FQDN allow-list, route table on agent + app subnets**.
+Firewall Basic with an on/off switch, default-deny FQDN allow-list, route table on agent + app subnets** ·
+**step 6b: Application Gateway WAF_v2 (DRS 2.1, Prevention) as the only entry, self-signed cert in Key Vault on the
+gateway's cloudapp name, app main site deny + private endpoint, SCM site kept public for deploys, NSGs per subnet**.
 
 ## How it works
 
@@ -62,8 +65,11 @@ flowchart LR
 
 ```
                      Internet
-                        │ HTTPS (inbound still public; step 6: App Gateway + WAF)
+                        │ HTTPS  chatbot-….cloudapp.azure.com
                         ▼
+  snet-appgw 10.20.4.0/24: Application Gateway + WAF (TLS cert from Key Vault via its private endpoint)
+                        │ HTTPS, Host = app-….azurewebsites.net, X-Original-Host = gateway name
+                        ▼ private endpoint 10.20.1.14   (direct azurewebsites.net URL: 403)
               App Service (web app) ── outbound via VNet integration (route all)
                         │
 VNet 10.20.0.0/16 ──────┼────────────────────────────────────────────────────────────
@@ -107,6 +113,10 @@ VNet 10.20.0.0/16 ──────┼─────────────�
 | **Azure Firewall Basic + route table** (step 6a) | Egress control: default deny, FQDN allow-list, logs | Concepts identical to Standard at ~1/3 the cost (~$0.40/h). On/off parameter to save cost between sessions. | Standard (~$1.25/h): DNS proxy, threat-intel deny, web categories (the baseline's choice). NAT Gateway: egress without filtering. |
 | **Allow-list from evidence** | Rules = documented platform needs + what the deny log shows | Each rule has a reason (e.g. PyPI found by a failed build) | Broad service tags or `*` rules (simpler, much weaker) |
 | **Default outbound access kept on agent/app subnets** | Fallback path when the firewall is switched off | The UDR overrides it while the firewall exists | Turn it off (then egress breaks completely when the firewall is off) |
+| **Application Gateway WAF_v2** (step 6b) | Single public entry, TLS termination, OWASP-style filtering | The baseline's ingress. DRS 2.1 in Prevention blocked SQLi/XSS, including inside JSON bodies. | Azure Front Door Premium + WAF (global edge, Private Link to the app) |
+| **Default domain + self-signed cert** | Gateway name `*.cloudapp.azure.com` | No domain needed for learning | Custom domain on gateway AND app (host preserved, no `X-Original-Host` workaround, no browser warning) |
+| **Main site deny + private endpoint; SCM public** | Only the gateway reaches the app; laptop deploys still work | Private-endpoint traffic skips access restrictions; SCM still needs Entra | SCM private too + build agents in the VNet (step 7) |
+| **NSGs** | L4 segmentation per subnet | Free. Limits blast radius. PE subnet only accepts the 3 client subnets. | Application security groups for finer grouping. Firewall for east-west inspection. |
 | **One search service for knowledge *and* agent vectors** | Cost saving | ~$80/month less | **Deviation:** the baseline uses a dedicated one, so a compromise of one use doesn't expose the other. Split before production. |
 | **gpt-5.4-mini**, 50K TPM | Generation + tool use | Agent-supported, cheap. 10K TPM caused 429s with grounding. | Larger models: maybe fewer skipped searches under `auto` (untested) |
 | **Azure AI Search tool** | Single-index retrieval | In the reference, and transparent | Foundry IQ for multi-source agentic retrieval |
@@ -198,6 +208,17 @@ conversation ID, and is absent across `/new`. Input tokens grow every turn.
 | **Our telemetry passes, logs lag** | Allowed: `swedencentral-0.in.applicationinsights.azure.com`, live metrics, SDK settings. Log tables appeared ~15 min after the firewall was created; metrics were immediate. | Use metrics for "is traffic flowing?" and logs for "what exactly?" |
 | A plain redeploy could reopen public access | `lockDown` defaulted to `false` | Default changed to `true`. Safe defaults for security parameters. |
 
+**Step 6b (2026-11-19):**
+
+| Observation | Evidence | Implication |
+|---|---|---|
+| **The gateway is the only way in, and the WAF blocks attacks** | Via gateway: normal `200`, SQLi `403`, XSS `403`, `<script>` in the chat JSON body `403`. Direct app URL `403`. Backend **Healthy** via `10.20.1.14`. | One inspected door. Attacks never reach the app or sign-in. |
+| **Sign-in works behind the proxy** | Entra `redirect_uri` = `https://chatbot-….cloudapp.azure.com/.auth/login/aad/callback` with `forwardProxy: Custom / X-Original-Host` | Without it, users land on the closed `azurewebsites.net` URL |
+| **First gateway creation needs a reachable vault** | Private-only vault → `ApplicationGatewayKeyVaultSecretAccessDenied`, gateway Stopped (role, PE and DNS correct). Vault open → created. Then vault closed → update **succeeded**, still Running. | Not in the docs. Two-step bring-up (`allowKeyVaultSetup`). |
+| **I caused a lockout by closing the old door first** | The failed deploy had already set the main site to Deny → users got 403 until I reopened it (~minutes) | `closeDirectAppAccess`: open the new door, verify, then close the old one |
+| **App Gateway isn't a Key Vault trusted service** | Troubleshooting docs; we used a private endpoint instead | Don't rely on `bypass: AzureServices` for the gateway |
+| **NSGs applied without breaking anything** | After attaching: gateway → app Healthy, app → Foundry/Cosmos private OK, app egress 443 OK | Segmentation is now enforced. Endpoint policies are on, so the PE NSG applies. |
+
 Small samples on one model: treat these as observations, not guarantees.
 
 ## When to propose it
@@ -207,10 +228,11 @@ from a web app with no secrets in config, plus server- and client-side traces fo
 Users sign in with Entra ID, only assigned users get in, and each user can only resume their own conversations.
 Agent state now lives in resources you own (Cosmos DB, Storage, Search).
 Data services are reachable only from inside the VNet.
-Egress is default-deny with an auditable allow-list.
-**Main adoption risks:** (1) the web app's inbound has no WAF (step 6b); (2) no NSGs, so subnets aren't
-segmented from each other; (3) operators have no private access path (step 7); (4) on-server builds aren't
-atomic (use slots or CI builds); (5) retrieval quality is checked by a 5-question eval. **Next validation:** a larger eval set, and
+Egress is default-deny with an auditable allow-list, ingress is one WAF-inspected entry point, and subnets
+are segmented. **Main adoption risks:** (1) no custom domain or CA certificate yet (browser warning, host name
+workaround); (2) operators have no private access path, and the SCM site is public (step 7: jump box/build
+agents); (3) single-zone, single-instance components (step 7); (4) on-server builds aren't atomic; (5) the
+5-question eval; (6) firewall and gateway are switched off between sessions, so check which are deployed. **Next validation:** a larger eval set, and
 assignment via a security group rather than individual users.
 
 ## Beyond the demo (gaps that matter here)
@@ -218,7 +240,7 @@ assignment via a security group rather than individual users.
 - The **user's identity isn't passed to Foundry**. The app calls as itself, so Foundry-side audit and Purview see the app, not the person (the baseline calls this out).
 - Anyone with *Foundry User* on the project can still read every conversation through the API, and anyone with Cosmos data roles can read them directly. Keep both role lists short.
 - One search service serves both knowledge and agent vectors (deviation from the baseline). Cosmos DB has no zone redundancy or continuous backup.
-- App Service inbound is public without a WAF (step 6b). No NSGs yet.
+- Self-signed certificate on a default `cloudapp` name; WAF in Prevention without tuning for false positives.
 - The firewall is Basic (no threat-intel deny, no DNS proxy) and can be switched off; when it's off, egress is unrestricted again.
 - Search → Foundry uses the trusted-services exception, not a private endpoint (needs Search S1+). No NSGs on subnets yet.
 - No private operator access: setup changes need `lockDown=false` temporarily (step 7 jump box/CI runner).

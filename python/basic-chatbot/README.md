@@ -1,4 +1,4 @@
-# Basic chatbot (steps 1–6a of the baseline Foundry chat architecture)
+# Basic chatbot (steps 1–6b of the baseline Foundry chat architecture)
 
 **What it shows:** the core of the [baseline Microsoft Foundry chat architecture](https://learn.microsoft.com/azure/architecture/ai-ml/architecture/baseline-microsoft-foundry-chat)
 ([diagram](chatbot-architecture.jpg)), built one step at a time.
@@ -10,11 +10,12 @@
 - **Step 4b:** **"Your chats" sidebar**. The app keeps its *own* index of each user's conversations (title, timestamps) in a **separate** serverless Cosmos account, partitioned by user. Reopening a chat loads its messages through Foundry's API.
 - **Step 5:** **private networking**. A VNet with private endpoints and private DNS for Foundry, AI Search, both Cosmos DB accounts and Storage; the agent runs **inside** the VNet (network injection); the web app's outbound traffic goes through the VNet. **Public network access is disabled on everything except the web app.** This required a new Foundry resource; the step 1–4 one was deleted and purged.
 - **Step 6a:** **egress control**. Azure Firewall (Basic) with a route table on the agent and app subnets: internet-bound traffic must pass a **default-deny** allow-list, and every attempt is logged. It can be switched off between sessions (`deployFirewall=false`).
+- **Step 6b:** **ingress control**. **Application Gateway + WAF** is the only public entry point (TLS certificate in Key Vault); the web app's own URL denies direct traffic and the gateway reaches it through a private endpoint. **NSGs** segment every subnet.
 
 Why it's built this way, and what we observed: [STACK.md](STACK.md).
 
-> Status: steps 1–6a deployed and verified on 2026-11-15/18 (resource group `rg-basic-chatbot`, Sweden Central).
-> Web app: `https://app-chatbot-5gq6mtdeqpdcw.azurewebsites.net`. **Entra sign-in is required, and only assigned users get in.**
+> Status: steps 1–6b deployed and verified on 2026-11-15/19 (resource group `rg-basic-chatbot`, Sweden Central).
+> Entry point: `https://chatbot-5gq6mtdeqpdcw.swedencentral.cloudapp.azure.com` (Application Gateway + WAF, **self-signed certificate: expect a browser warning**). The app's own `azurewebsites.net` URL returns 403. **Entra sign-in is required, and only assigned users get in.**
 > **Hourly billing while it exists:** AI Search Basic ~$0.11/h + App Service B1 ~$0.018/h. See [Cleanup](#cleanup).
 
 ## Azure resources
@@ -43,6 +44,10 @@ Defined in [`infra/main.bicep`](infra/main.bicep), region Sweden Central:
 | **Foundry resource `fdy-chatbot-vnet-…`** with network injection into `snet-agent`; replaces the step 1–4 resource | 5 | none at idle |
 | **Azure Firewall (Basic)** `afw-chatbot-…` in `AzureFirewallSubnet` (10.20.3.0/26, private IP 10.20.3.4) + `AzureFirewallManagementSubnet` (10.20.3.64/26), 2 public IPs, firewall policy `egress-allow-list`, logs to Log Analytics | 6a | **~$0.40/hour** + $0.065/GB; switch off with `deployFirewall=false` |
 | Route table `rt-egress-…` on `snet-agent` + `snet-appsvc`: `0.0.0.0/0 → 10.20.3.4` (empty when the firewall is off) | 6a | free |
+| **Application Gateway WAF_v2** `agw-chatbot-…` in `snet-appgw` (10.20.4.0/24), public IP with DNS label, WAF policy (Microsoft Default Rule Set 2.1, **Prevention**), autoscale 0–2, logs to Log Analytics | 6b | **~$0.45/hour**; switch off like the firewall |
+| **Key Vault** `kv-chatbot-…` (RBAC, private endpoint) holding the gateway's TLS certificate `agw-tls`; user-assigned identity for the gateway | 6b | ~free |
+| **Web app private endpoint** (`sites`) + DNS zones `privatelink.azurewebsites.net`, `privatelink.vaultcore.azure.net` | 6b | ~$15/month (2 endpoints) |
+| **NSGs** on `snet-agent`, `snet-pe` (private endpoint network policies enabled), `snet-appsvc`, `snet-appgw` | 6b | free |
 
 Role assignments (all keyless):
 
@@ -88,6 +93,9 @@ Firewall switches (Bicep parameters, all default to the safe value):
 | `lockDown` | `true` | `false` reopens public access on data services (temporary laptop work) |
 | `deployFirewall` | `true` | `false` empties the route table (egress goes direct, unrestricted). It does **not** delete the firewall: delete it separately to stop billing (see Cleanup). |
 | `experimentAllowedFqdns` | `[]` | extra hostnames the **app** subnet may reach, e.g. `'["example.com"]'` |
+| `deployAppGateway` | `true` | `false`: no gateway, app public again. Like the firewall, it doesn't delete an existing gateway. |
+| `closeDirectAppAccess` | `true` | `false` keeps the app's own URL open (use while bringing up or debugging the gateway) |
+| `allowKeyVaultSetup` | `false` | `true` opens Key Vault to the internet (still RBAC). Needed to **create the certificate** and for the gateway's **first creation**. |
 
 ## Deploy
 
@@ -338,6 +346,24 @@ In the web UI each answer shows its searches, citations, agent version and token
 - *Observe:* all allowed egress from the agent and app subnets leaves from the firewall's public IP (`az network public-ip show -g rg-basic-chatbot -n pip-fw-<suffix> --query ipAddress`).
 - *Explain:* external partners can allow-list a single, stable address. Without the firewall, outbound IPs are shared and change.
 
+### Step 6b
+
+**27. One door in, and it inspects what comes through**
+- *Observe (2026-11-19):* via the gateway, a normal request gets `200`; `?q=1' OR '1'='1' --` (SQL injection) **403**; `?q=<script>alert(1)</script>` (XSS) **403**; a `<script>` payload inside the chat **JSON body** **403**. The direct app URL returns **403**, and the gateway reports the backend **Healthy** via the app's private endpoint (`10.20.1.14`).
+- *Explain:* the WAF blocks known attack patterns before they reach the app, and before sign-in even runs. Access restrictions ("main site: deny") close the old door, and private-endpoint traffic isn't subject to them, which is how the gateway gets in.
+
+**28. Sign-in behind a reverse proxy**
+- *Predict:* the gateway sends `Host: app-….azurewebsites.net` to the app. Where does Entra send the user back after sign-in?
+- *Observe:* with `forwardProxy: Custom / X-Original-Host`, the `redirect_uri` sent to Entra is `https://chatbot-….cloudapp.azure.com/.auth/login/aad/callback` (the gateway's name).
+- *Explain:* without it, the user would be sent to the app's own URL, which now returns 403. Production fix: a custom domain on both gateway and app, so the host name never changes.
+
+**29. The certificate chicken-and-egg (not in the docs)**
+- *Observe:* creating the gateway with Key Vault private-only failed: `ApplicationGatewayKeyVaultSecretAccessDenied`, gateway **Stopped**, although role, private endpoint and DNS were all correct. With the vault temporarily open it was created; afterwards **updates with the vault closed succeeded**.
+- *Explain:* a new gateway validates the certificate before its instances run inside the VNet, so it can't use the private endpoint yet. Once running, it can. Also: the failed attempt had already closed the app's direct URL, so **users were locked out** until it was reopened. Hence `closeDirectAppAccess`: open the new door before closing the old one.
+
+**30. NSGs: segmentation inside the network**
+- *Explain:* the private endpoint subnet only accepts traffic from the agent, app and gateway subnets (everything else in the VNet is denied), the agent subnet accepts no inbound traffic at all, and agent/app outbound is limited to private endpoints + HTTPS. NSG rules only apply to private endpoints when the subnet's *private endpoint network policies* are enabled (off by default).
+
 ## Troubleshooting
 
 - **`tool_user_error` (400) from a grounded agent**: the *project* identity lacks roles on Search (see the RBAC table), or a new role hasn't propagated yet.
@@ -358,6 +384,10 @@ In the web UI each answer shows its searches, citations, agent version and token
 - **The app's outbound traffic isn't routed through the VNet**: `siteConfig.vnetRouteAllEnabled` is silently ignored by `Microsoft.Web/sites@2024-11-01`. Use `properties.outboundVnetRouting.applicationTraffic: true` and check the deployed value.
 - **New app code deployed but the old code still answers**: the zip deploy succeeded, but the process wasn't restarted. Run `az webapp restart` and verify a new route.
 - **App Insights query returns nothing for older data**: `az monitor app-insights query` searches only the **last hour** unless you pass `--offset` (e.g. `--offset 2d`), whatever the query's `ago()` says.
+- **Gateway fails with `ApplicationGatewayKeyVaultSecretAccessDenied` and is Stopped**: on FIRST creation the vault must be reachable: redeploy with `allowKeyVaultSetup=true closeDirectAppAccess=false`, then again with the defaults.
+- **Users get 403 everywhere**: the app's direct URL is closed but the gateway isn't working. Reopen it: `az resource update -g rg-basic-chatbot -n <webAppName> --resource-type Microsoft.Web/sites --set properties.siteConfig.ipSecurityRestrictionsDefaultAction=Allow`.
+- **Sign-in sends you to `azurewebsites.net` (403) after login**: `forwardProxy` isn't set to `Custom` + `X-Original-Host`, or the gateway callback URL is missing from the app registration.
+- **Browser warning on the gateway URL**: expected, because the certificate is self-signed. Use a custom domain + CA certificate for real users.
 - **App build fails with `SSL: UNEXPECTED_EOF_WHILE_READING` / `Could not fetch URL https://pypi.org…`**: the firewall blocks PyPI. Allow `pypi.org` + `files.pythonhosted.org` for `snet-appsvc` (done in Bicep), or build in CI.
 - **App returns 5xx after a failed deploy**: the on-server build broke the running app. Fix the cause and redeploy. `deploy_app.sh` now fails loudly if `/healthz/deps` isn't 200 after the deploy.
 - **New route returns 404 after a successful deploy**: the old process kept running (seen twice). `deploy_app.sh` now restarts the app after every deployment.
@@ -381,6 +411,16 @@ az network firewall delete -g rg-basic-chatbot -n afw-chatbot-<suffix>
 az network public-ip delete -g rg-basic-chatbot -n pip-fw-<suffix>
 az network public-ip delete -g rg-basic-chatbot -n pip-fw-mgmt-<suffix>
 # Bring it back later: redeploy with the default deployFirewall=true (~10 min).
+```
+
+Stop the Application Gateway (~$0.45/h). Same pattern: reopen the app first, then delete:
+
+```bash
+az deployment group create -g rg-basic-chatbot -f infra/main.bicep \
+  -p userPrincipalId=$(az ad signed-in-user show --query id -o tsv) deployFirewall=false deployAppGateway=false
+az network application-gateway delete -g rg-basic-chatbot -n agw-chatbot-<suffix>
+az network public-ip delete -g rg-basic-chatbot -n pip-agw-<suffix>
+# Bring it back: allowKeyVaultSetup=true closeDirectAppAccess=false (first creation), then the defaults.
 ```
 
 While the firewall is off, **egress from the agent and app subnets is unrestricted**.

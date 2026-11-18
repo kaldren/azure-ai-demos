@@ -9,11 +9,12 @@
 // Step 4, standard agent setup (agent state in our Cosmos DB / Storage / Search).
 // Step 5, private networking: VNet, private endpoints + DNS, agent network injection, public access off.
 // Step 6a, egress control: Azure Firewall (Basic) + route table; only allow-listed destinations get out.
+// Step 6b, ingress control: Application Gateway + WAF as the only public entry; TLS cert in Key Vault.
 //
 // We use the *basic* agent setup here, so conversation state is kept in Microsoft-managed
 // storage. Step 4 replaces it with your own Cosmos DB / Storage / AI Search ("standard setup").
 //
-// Deliberately NOT here yet: App Gateway + WAF and NSGs (step 6b), Bastion/jump box (step 7).
+// Deliberately NOT here yet: Bastion/jump box, build agents, zone redundancy (step 7).
 // Two layers now: identity (Entra ID + RBAC, no API keys) AND network (private endpoints).
 
 targetScope = 'resourceGroup'
@@ -59,6 +60,17 @@ param firewallManagementSubnetPrefix string = '10.20.3.64/26' // AzureFirewallMa
 
 @description('Step 6a. true: deploy Azure Firewall (Basic, ~$0.40/h) and route all internet-bound traffic from the agent and app subnets through it. false: empty the route table (direct, unrestricted egress). NOTE: false does not delete an existing firewall (incremental deployment); delete it separately to stop billing (README → Cleanup).')
 param deployFirewall bool = true
+
+param appGatewaySubnetPrefix string = '10.20.4.0/24' // Application Gateway v2: dedicated subnet, /24 recommended
+
+@description('Step 6b. true: Application Gateway (WAF_v2, ~$0.45/h) is the only public entry; the web app main site denies direct public traffic. false: no gateway; the app is public again. Like the firewall, false does NOT delete an existing gateway.')
+param deployAppGateway bool = true
+
+@description('Step 6b, one-off. true: open the Key Vault to the internet (still Entra + RBAC) so the TLS certificate can be created from a laptop. Default false: vault reachable only via its private endpoint.')
+param allowKeyVaultSetup bool = false
+
+@description('Step 6b. true: the web app main site denies direct public traffic (users must come through the gateway). Set false while bringing up or debugging the gateway: open the new door before closing the old one.')
+param closeDirectAppAccess bool = true
 
 @description('Step 6a experiment: extra websites the APP subnet may reach through the firewall, e.g. ["example.com"]. Empty = only the platform allow-list.')
 param experimentAllowedFqdns array = []
@@ -345,7 +357,14 @@ resource webApp 'Microsoft.Web/sites@2024-11-01' = {
     outboundVnetRouting: {
       applicationTraffic: true
     }
+    // Step 6b: "public access Enabled" + "main site: deny all" + "deployment (SCM) site: allow" means
+    // users can only come in through the gateway (private endpoint traffic skips access restrictions),
+    // while deploy_app.sh can still reach the SCM site from a laptop (Entra-authenticated).
+    publicNetworkAccess: 'Enabled'
     siteConfig: {
+      ipSecurityRestrictionsDefaultAction: deployAppGateway && closeDirectAppAccess ? 'Deny' : 'Allow'
+      scmIpSecurityRestrictionsUseMain: false
+      scmIpSecurityRestrictionsDefaultAction: 'Allow'
       linuxFxVersion: 'PYTHON|3.14'
       appCommandLine: 'gunicorn -w 2 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:8000 --timeout 180 main:app'
       alwaysOn: true
@@ -716,6 +735,192 @@ resource userSessionsData 'Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignme
 }
 
 // ---------------------------------------------------------------------------------------------
+// Step 6b: ingress control (diagram ①: Application Gateway + WAF, Key Vault for its certificate)
+// Docs: https://learn.microsoft.com/azure/app-service/overview-app-gateway-integration
+//       https://learn.microsoft.com/azure/application-gateway/key-vault-certs
+// ---------------------------------------------------------------------------------------------
+
+var appGatewayName = 'agw-${baseName}-${suffix}'
+var appGatewayDnsLabel = '${baseName}-${suffix}'
+// <label>.<region>.cloudapp.azure.com: the gateway's public name. No custom domain here, so the TLS
+// certificate is self-signed (browser warning). Production: your own domain + a CA-issued certificate.
+var appGatewayFqdn = '${appGatewayDnsLabel}.${location}.cloudapp.azure.com'
+var tlsCertificateName = 'agw-tls'
+var keyVaultRoles = {
+  secretsUser: '4633458b-17de-408a-b874-0445c86b69e6' // read certificates (as secrets): the gateway
+  certificatesOfficer: 'a4417e6f-fecd-4de8-b567-7b0420556985' // create certificates: you, once
+}
+
+// Key Vault box in the diagram: holds the gateway's TLS certificate (private key never leaves Azure).
+resource keyVault 'Microsoft.KeyVault/vaults@2024-11-01' = {
+  name: take('kv-${baseName}-${suffix}', 24)
+  location: location
+  properties: {
+    tenantId: tenant().tenantId
+    sku: { family: 'A', name: 'standard' }
+    enableRbacAuthorization: true // Entra roles, no access policies
+    enableSoftDelete: true
+    softDeleteRetentionInDays: 7 // short for a learning build; production: longer + purge protection
+    // Application Gateway v2 is NOT a Key Vault "trusted service" (troubleshooting docs), so it reads the
+    // certificate through the vault's private endpoint. Open only while creating the certificate.
+    publicNetworkAccess: allowKeyVaultSetup ? 'Enabled' : 'Disabled'
+    networkAcls: { defaultAction: allowKeyVaultSetup ? 'Allow' : 'Deny', bypass: 'None' }
+  }
+}
+
+resource userKeyVaultCertificates 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  scope: keyVault
+  name: guid(keyVault.id, userPrincipalId, keyVaultRoles.certificatesOfficer)
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', keyVaultRoles.certificatesOfficer)
+    principalId: userPrincipalId
+    principalType: 'User'
+  }
+}
+
+// Application Gateway can only use a USER-assigned identity for Key Vault.
+resource appGatewayIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2024-11-30' = {
+  name: 'id-${baseName}-agw-${suffix}'
+  location: location
+}
+
+resource appGatewayReadsCertificate 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  scope: keyVault
+  name: guid(keyVault.id, appGatewayIdentity.id, keyVaultRoles.secretsUser)
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', keyVaultRoles.secretsUser)
+    principalId: appGatewayIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+resource appGatewayPublicIp 'Microsoft.Network/publicIPAddresses@2024-05-01' = if (deployAppGateway) {
+  name: 'pip-agw-${suffix}'
+  location: location
+  sku: { name: 'Standard' }
+  properties: {
+    publicIPAllocationMethod: 'Static'
+    dnsSettings: { domainNameLabel: appGatewayDnsLabel }
+  }
+}
+
+// The WAF: inspects every request (OWASP-style attacks, known exploit patterns) before it reaches the app.
+resource wafPolicy 'Microsoft.Network/ApplicationGatewayWebApplicationFirewallPolicies@2024-05-01' = if (deployAppGateway) {
+  name: 'waf-${baseName}-${suffix}'
+  location: location
+  properties: {
+    policySettings: {
+      state: 'Enabled'
+      mode: 'Prevention' // block, don't just log ('Detection')
+      requestBodyCheck: true // the chat message is in the JSON body
+      maxRequestBodySizeInKb: 128
+      fileUploadLimitInMb: 1
+    }
+    managedRules: {
+      managedRuleSets: [
+        { ruleSetType: 'Microsoft_DefaultRuleSet', ruleSetVersion: '2.1' } // Microsoft's OWASP-based rules
+      ]
+    }
+  }
+}
+
+var agwId = resourceId('Microsoft.Network/applicationGateways', appGatewayName)
+
+resource appGateway 'Microsoft.Network/applicationGateways@2024-05-01' = if (deployAppGateway) {
+  name: appGatewayName
+  location: location
+  identity: {
+    type: 'UserAssigned'
+    userAssignedIdentities: { '${appGatewayIdentity.id}': {} }
+  }
+  properties: {
+    sku: { name: 'WAF_v2', tier: 'WAF_v2' }
+    autoscaleConfiguration: { minCapacity: 0, maxCapacity: 2 } // 0 = pay only the fixed hourly price when idle
+    firewallPolicy: { id: wafPolicy.id }
+    sslPolicy: { policyType: 'Predefined', policyName: 'AppGwSslPolicy20220101' } // TLS 1.2+
+    gatewayIPConfigurations: [{ name: 'gateway', properties: { subnet: { id: vnet::appGatewaySubnet.id } } }]
+    frontendIPConfigurations: [{ name: 'public', properties: { publicIPAddress: { id: appGatewayPublicIp.id } } }]
+    frontendPorts: [{ name: 'https', properties: { port: 443 } }]
+    sslCertificates: [
+      {
+        name: 'tls'
+        // Versionless secret URI: a renewed certificate is picked up automatically.
+        properties: { keyVaultSecretId: '${keyVault.properties.vaultUri}secrets/${tlsCertificateName}' }
+      }
+    ]
+    httpListeners: [
+      {
+        name: 'https'
+        properties: {
+          frontendIPConfiguration: { id: '${agwId}/frontendIPConfigurations/public' }
+          frontendPort: { id: '${agwId}/frontendPorts/https' }
+          protocol: 'Https'
+          sslCertificate: { id: '${agwId}/sslCertificates/tls' }
+        }
+      }
+    ]
+    // The backend is the web app's normal name. Inside the VNet it resolves (privatelink.azurewebsites.net)
+    // to the app's PRIVATE endpoint, so gateway → app never touches the internet.
+    backendAddressPools: [{ name: 'app', properties: { backendAddresses: [{ fqdn: '${webAppName}.azurewebsites.net' }] } }]
+    probes: [
+      {
+        name: 'healthz'
+        properties: {
+          protocol: 'Https'
+          path: '/healthz' // excluded from sign-in
+          interval: 30
+          timeout: 30
+          unhealthyThreshold: 3
+          pickHostNameFromBackendHttpSettings: true
+          match: { statusCodes: ['200-399'] }
+        }
+      }
+    ]
+    backendHttpSettingsCollection: [
+      {
+        name: 'app-https'
+        properties: {
+          port: 443
+          protocol: 'Https'
+          // App Service routes by Host header, so it must be the app's own name; the original name travels
+          // in X-Original-Host (see authsettingsV2 forwardProxy).
+          pickHostNameFromBackendAddress: true
+          requestTimeout: 180 // agent turns can take several seconds
+          probe: { id: '${agwId}/probes/healthz' }
+        }
+      }
+    ]
+    requestRoutingRules: [
+      {
+        name: 'app'
+        properties: {
+          ruleType: 'Basic'
+          priority: 100
+          httpListener: { id: '${agwId}/httpListeners/https' }
+          backendAddressPool: { id: '${agwId}/backendAddressPools/app' }
+          backendHttpSettings: { id: '${agwId}/backendHttpSettingsCollection/app-https' }
+        }
+      }
+    ]
+  }
+  // Certificate access must work before the gateway reads it: role + the vault's private endpoint + DNS.
+  dependsOn: [appGatewayReadsCertificate, privateEndpointDns]
+}
+
+resource appGatewayLogs 'Microsoft.Insights/diagnosticSettings@2021-05-01-preview' = if (deployAppGateway) {
+  name: 'to-log-analytics'
+  scope: appGateway
+  properties: {
+    workspaceId: logs.id
+    logAnalyticsDestinationType: 'Dedicated' // AGWAccessLogs, AGWFirewallLogs
+    logs: [
+      { category: 'ApplicationGatewayAccessLog', enabled: true }
+      { category: 'ApplicationGatewayFirewallLog', enabled: true }
+    ]
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Step 3b: Entra ID sign-in for the web app (App Service built-in authentication)
 // Docs: https://learn.microsoft.com/azure/app-service/configure-authentication-provider-aad
 // ---------------------------------------------------------------------------------------------
@@ -736,7 +941,8 @@ resource appRegistration 'Microsoft.Graph/applications@v1.0' = {
   displayName: 'Contoso Policy Chat (${webAppName})'
   signInAudience: 'AzureADMyOrg'
   web: {
-    redirectUris: ['${webAppUrl}/.auth/login/aad/callback']
+    // Step 6b: users now sign in on the gateway's host name too.
+    redirectUris: ['${webAppUrl}/.auth/login/aad/callback', 'https://${appGatewayFqdn}/.auth/login/aad/callback']
     implicitGrantSettings: {
       enableIdTokenIssuance: true // App Service auth uses the hybrid flow (code + id_token)
     }
@@ -787,6 +993,12 @@ resource webAppAuth 'Microsoft.Web/sites/config@2024-11-01' = {
     }
     httpSettings: {
       requireHttps: true
+      // Step 6b: behind Application Gateway the Host header is the app's azurewebsites.net name. The gateway
+      // passes the name the browser used in X-Original-Host; without this, sign-in redirects to the wrong host.
+      forwardProxy: {
+        convention: 'Custom'
+        customHostHeaderName: 'X-Original-Host'
+      }
     }
     identityProviders: {
       azureActiveDirectory: {
@@ -816,6 +1028,102 @@ resource webAppAuth 'Microsoft.Web/sites/config@2024-11-01' = {
 // Pattern: foundry-samples 15-private-network-standard-agent-setup
 // ---------------------------------------------------------------------------------------------
 
+// Step 6b: network security groups (NSGs), L4 allow/deny rules per subnet. Segmentation: a compromised
+// subnet can only reach what its rules allow. Pattern: the baseline reference architecture.
+// Rules use explicit Deny at priority 4000 to override Azure's default "allow all VNet traffic" rule.
+resource nsgAgent 'Microsoft.Network/networkSecurityGroups@2024-05-01' = {
+  name: 'nsg-agent-${suffix}'
+  location: location
+  properties: {
+    securityRules: [
+      {
+        name: 'DenyAllInbound' // no legitimate inbound traffic to the agent runtime (baseline)
+        properties: { priority: 4000, direction: 'Inbound', access: 'Deny', protocol: '*', sourceAddressPrefix: '*', sourcePortRange: '*', destinationAddressPrefix: '*', destinationPortRange: '*' }
+      }
+      {
+        name: 'AllowPrivateEndpoints' // Search, Cosmos DB (all ports, per the baseline), Storage
+        properties: { priority: 100, direction: 'Outbound', access: 'Allow', protocol: '*', sourceAddressPrefix: agentSubnetPrefix, sourcePortRange: '*', destinationAddressPrefix: privateEndpointSubnetPrefix, destinationPortRange: '*' }
+      }
+      {
+        name: 'AllowHttpsInternet' // Entra ID, App Insights (and through the firewall when it's on)
+        properties: { priority: 110, direction: 'Outbound', access: 'Allow', protocol: 'Tcp', sourceAddressPrefix: agentSubnetPrefix, sourcePortRange: '*', destinationAddressPrefix: 'Internet', destinationPortRange: '443' }
+      }
+      {
+        name: 'DenyAllOutbound'
+        properties: { priority: 4000, direction: 'Outbound', access: 'Deny', protocol: '*', sourceAddressPrefix: '*', sourcePortRange: '*', destinationAddressPrefix: '*', destinationPortRange: '*' }
+      }
+    ]
+  }
+}
+
+resource nsgAppService 'Microsoft.Network/networkSecurityGroups@2024-05-01' = {
+  name: 'nsg-appsvc-${suffix}'
+  location: location
+  properties: {
+    securityRules: [
+      // Integration subnets carry only the app's OUTBOUND traffic; inbound rules wouldn't apply.
+      {
+        name: 'AllowPrivateEndpoints' // Foundry, app Cosmos DB
+        properties: { priority: 100, direction: 'Outbound', access: 'Allow', protocol: '*', sourceAddressPrefix: appServiceSubnetPrefix, sourcePortRange: '*', destinationAddressPrefix: privateEndpointSubnetPrefix, destinationPortRange: '*' }
+      }
+      {
+        name: 'AllowHttpsInternet' // Entra ID (sign-in), App Insights, PyPI during builds
+        properties: { priority: 110, direction: 'Outbound', access: 'Allow', protocol: 'Tcp', sourceAddressPrefix: appServiceSubnetPrefix, sourcePortRange: '*', destinationAddressPrefix: 'Internet', destinationPortRange: '443' }
+      }
+      {
+        name: 'DenyAllOutbound'
+        properties: { priority: 4000, direction: 'Outbound', access: 'Deny', protocol: '*', sourceAddressPrefix: '*', sourcePortRange: '*', destinationAddressPrefix: '*', destinationPortRange: '*' }
+      }
+    ]
+  }
+}
+
+resource nsgPrivateEndpoints 'Microsoft.Network/networkSecurityGroups@2024-05-01' = {
+  name: 'nsg-pe-${suffix}'
+  location: location
+  properties: {
+    securityRules: [
+      {
+        name: 'AllowFromAgent'
+        properties: { priority: 100, direction: 'Inbound', access: 'Allow', protocol: '*', sourceAddressPrefix: agentSubnetPrefix, sourcePortRange: '*', destinationAddressPrefix: privateEndpointSubnetPrefix, destinationPortRange: '*' }
+      }
+      {
+        name: 'AllowFromAppService'
+        properties: { priority: 110, direction: 'Inbound', access: 'Allow', protocol: '*', sourceAddressPrefix: appServiceSubnetPrefix, sourcePortRange: '*', destinationAddressPrefix: privateEndpointSubnetPrefix, destinationPortRange: '*' }
+      }
+      {
+        name: 'AllowHttpsFromAppGateway' // gateway → web app endpoint, gateway → Key Vault endpoint
+        properties: { priority: 120, direction: 'Inbound', access: 'Allow', protocol: 'Tcp', sourceAddressPrefix: appGatewaySubnetPrefix, sourcePortRange: '*', destinationAddressPrefix: privateEndpointSubnetPrefix, destinationPortRange: '443' }
+      }
+      {
+        name: 'DenyOtherVNetInbound' // e.g. a future jump box subnet needs an explicit rule (step 7)
+        properties: { priority: 4000, direction: 'Inbound', access: 'Deny', protocol: '*', sourceAddressPrefix: 'VirtualNetwork', sourcePortRange: '*', destinationAddressPrefix: '*', destinationPortRange: '*' }
+      }
+    ]
+  }
+}
+
+resource nsgAppGateway 'Microsoft.Network/networkSecurityGroups@2024-05-01' = {
+  name: 'nsg-appgw-${suffix}'
+  location: location
+  properties: {
+    securityRules: [
+      {
+        name: 'AllowHttpsFromInternet' // the users
+        properties: { priority: 100, direction: 'Inbound', access: 'Allow', protocol: 'Tcp', sourceAddressPrefix: 'Internet', sourcePortRange: '*', destinationAddressPrefix: '*', destinationPortRange: '443' }
+      }
+      {
+        name: 'AllowGatewayManager' // required by Application Gateway v2 (Azure's management of the gateway)
+        properties: { priority: 110, direction: 'Inbound', access: 'Allow', protocol: '*', sourceAddressPrefix: 'GatewayManager', sourcePortRange: '*', destinationAddressPrefix: '*', destinationPortRange: '65200-65535' }
+      }
+      {
+        name: 'AllowAzureLoadBalancer' // required (health of the gateway instances)
+        properties: { priority: 120, direction: 'Inbound', access: 'Allow', protocol: '*', sourceAddressPrefix: 'AzureLoadBalancer', sourcePortRange: '*', destinationAddressPrefix: '*', destinationPortRange: '*' }
+      }
+    ]
+  }
+}
+
 resource vnet 'Microsoft.Network/virtualNetworks@2024-05-01' = {
   name: 'vnet-${baseName}-${suffix}'
   location: location
@@ -833,6 +1141,7 @@ resource vnet 'Microsoft.Network/virtualNetworks@2024-05-01' = {
           // true only as the fallback path when deployFirewall=false (then the route table is empty).
           defaultOutboundAccess: true
           routeTable: { id: egressRoutes.id }
+          networkSecurityGroup: { id: nsgAgent.id }
         }
       }
       {
@@ -841,6 +1150,9 @@ resource vnet 'Microsoft.Network/virtualNetworks@2024-05-01' = {
         properties: {
           addressPrefix: privateEndpointSubnetPrefix
           defaultOutboundAccess: false
+          networkSecurityGroup: { id: nsgPrivateEndpoints.id }
+          // Off by default: without this, NSG rules are NOT enforced on private endpoints.
+          privateEndpointNetworkPolicies: 'Enabled'
         }
       }
       {
@@ -851,6 +1163,7 @@ resource vnet 'Microsoft.Network/virtualNetworks@2024-05-01' = {
           delegations: [{ name: 'app-service', properties: { serviceName: 'Microsoft.Web/serverFarms' } }]
           defaultOutboundAccess: true
           routeTable: { id: egressRoutes.id }
+          networkSecurityGroup: { id: nsgAppService.id }
         }
       }
       {
@@ -861,6 +1174,14 @@ resource vnet 'Microsoft.Network/virtualNetworks@2024-05-01' = {
         name: 'AzureFirewallManagementSubnet' // exact name; Basic tier keeps its management traffic here
         properties: { addressPrefix: firewallManagementSubnetPrefix }
       }
+      {
+        // "Application Gateway subnet": the only public entry point (step 6b).
+        name: 'snet-appgw'
+        properties: {
+          addressPrefix: appGatewaySubnetPrefix
+          networkSecurityGroup: { id: nsgAppGateway.id }
+        }
+      }
     ]
   }
 
@@ -869,6 +1190,7 @@ resource vnet 'Microsoft.Network/virtualNetworks@2024-05-01' = {
   resource appServiceSubnet 'subnets' existing = { name: 'snet-appsvc' }
   resource firewallSubnet 'subnets' existing = { name: 'AzureFirewallSubnet' }
   resource firewallManagementSubnet 'subnets' existing = { name: 'AzureFirewallManagementSubnet' }
+  resource appGatewaySubnet 'subnets' existing = { name: 'snet-appgw' }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1076,6 +1398,8 @@ var privateDnsZoneNames = [
   'privatelink.search.windows.net'
   'privatelink.documents.azure.com' // both Cosmos DB accounts
   'privatelink.blob.${environment().suffixes.storage}' // = privatelink.blob.core.windows.net in public Azure
+  'privatelink.vaultcore.azure.net' // step 6b: Key Vault (the gateway's TLS certificate)
+  'privatelink.azurewebsites.net' // step 6b: the web app's inbound private endpoint (gateway → app)
 ]
 
 resource dnsZones 'Microsoft.Network/privateDnsZones@2024-06-01' = [
@@ -1104,6 +1428,8 @@ var privateEndpoints = [
   { name: 'cosmos-agent', resourceId: cosmos.id, groupId: 'Sql', zones: [4] }
   { name: 'cosmos-app', resourceId: appCosmos.id, groupId: 'Sql', zones: [4] }
   { name: 'storage-blob', resourceId: agentStorage.id, groupId: 'blob', zones: [5] }
+  { name: 'keyvault', resourceId: keyVault.id, groupId: 'vault', zones: [6] }
+  { name: 'webapp', resourceId: webApp.id, groupId: 'sites', zones: [7] }
 ]
 
 resource privateEndpointResources 'Microsoft.Network/privateEndpoints@2024-05-01' = [
@@ -1158,3 +1484,5 @@ output vnetName string = vnet.name
 output lockedDown bool = lockDown
 output firewallDeployed bool = deployFirewall
 output firewallPrivateIp string = firewallPrivateIp
+output appGatewayUrl string = 'https://${appGatewayFqdn}'
+output keyVaultName string = keyVault.name
