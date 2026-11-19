@@ -2,6 +2,12 @@
 
 Small, self-contained demos for trying out Azure services in .NET and Python.
 
+## Demos
+
+| Demo | What it teaches |
+|---|---|
+| [`python/basic-chatbot`](python/basic-chatbot/ARCHITECTURE.md) | A private, grounded chat agent on Microsoft Foundry, built step by step toward the [baseline Foundry chat reference architecture](https://learn.microsoft.com/azure/architecture/ai-ml/architecture/baseline-microsoft-foundry-chat): agents, RAG with AI Search, managed identities, Entra sign-in, private networking, firewall, WAF. |
+
 ## Layout
 
 ```

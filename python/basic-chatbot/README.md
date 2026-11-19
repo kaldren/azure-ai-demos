@@ -1,5 +1,7 @@
 # Basic chatbot (steps 1–6b of the baseline Foundry chat architecture)
 
+> **New here? Start with [ARCHITECTURE.md](ARCHITECTURE.md):** the diagram, one request end to end, and what's built.
+
 **What it shows:** the core of the [baseline Microsoft Foundry chat architecture](https://learn.microsoft.com/azure/architecture/ai-ml/architecture/baseline-microsoft-foundry-chat)
 ([diagram](chatbot-architecture.jpg)), built one step at a time.
 - **Step 1:** a terminal client calls a **prompt agent** in **Foundry Agent Service** by name and pinned version. The agent calls a model, and Foundry stores the conversation server-side.
@@ -15,7 +17,7 @@
 Why it's built this way, and what we observed: [STACK.md](STACK.md).
 
 > Status: steps 1–6b deployed and verified on 2026-11-15/19 (resource group `rg-basic-chatbot`, Sweden Central).
-> Entry point: `https://chatbot-5gq6mtdeqpdcw.swedencentral.cloudapp.azure.com` (Application Gateway + WAF, **self-signed certificate: expect a browser warning**). The app's own `azurewebsites.net` URL returns 403. **Entra sign-in is required, and only assigned users get in.**
+> Entry point: `https://<baseName>-<suffix>.<region>.cloudapp.azure.com` (Bicep output `appGatewayUrl`) (Application Gateway + WAF, **self-signed certificate: expect a browser warning**). The app's own `azurewebsites.net` URL returns 403. **Entra sign-in is required, and only assigned users get in.**
 > **Hourly billing while it exists:** AI Search Basic ~$0.11/h + App Service B1 ~$0.018/h. See [Cleanup](#cleanup).
 
 ## Azure resources
