@@ -122,7 +122,9 @@ VNet 10.20.0.0/16 ──────┼─────────────�
 | **Azure AI Search tool** | Single-index retrieval | In the reference, and transparent | Foundry IQ for multi-source agentic retrieval |
 | **AI Search Basic, hybrid + semantic** | Index + vectorizer | Cheapest tier with an outbound MI (keyless vectorizer) | Free tier: keyword + semantic only |
 | **text-embedding-3-small**, section chunks | Embeddings, chunking | Cheap. Policies are naturally sectioned. | `-3-large`, overlapping chunks for long documents |
-| **FastAPI on App Service B1 (Linux, Py 3.14)** | Chat API + static page | Smallest hosted tier, ~$0.018/h. Zip deploy + Oryx build, no container. | Container Apps; P0v3+ for zone redundancy (the diagram's 3 instances) |
+| **FastAPI on App Service (Linux, Py 3.14)**, B1 → **P0v3** in step 7a | Chat API + static page | B1 was the smallest hosted tier (~$0.018/h). P0v3 (~$0.089/h) is the cheapest tier with slots *and* zones. Zip deploy + Oryx build, no container. | Container Apps; a container image built in CI (the closest thing to run-from-package, which isn't supported for Python) |
+| **Azure Bastion Standard + Linux jump box** (step 7b) | Private operator access | Standard = native client (terminal sessions, tunnels, file copy) with Entra sign-in. VM: Entra SSH login, no public IP, no roles of its own. | Basic ($0.19/h, browser sessions only); Developer (free, no Entra sign-in, one session); point-to-site VPN; CI runner in the VNet for repeatable jobs |
+| **Staging slot + warm-up-gated swap** (step 7a) | Safe deploys | Builds and cold starts happen off the live slot. App Service itself aborts the swap unless `/healthz/deps` returns 200. One-command rollback. | Swap with preview (not allowed with App Service auth on), CI pipeline in the VNet, blue/green behind the gateway |
 | **System-assigned managed identity** | App → Foundry auth | No secrets. Same RBAC as a user. | User-assigned MI if several apps share one identity |
 | **Conversation ID in the browser** | Session continuity | Keeps the server stateless (restarts and scale-out are safe) | Safe only with the owner check below |
 | **App Service built-in auth (Easy Auth)** | End-user sign-in before code runs | No auth code to write or get wrong. Identity headers are unforgeable. | MSAL in app code for custom flows. API Management / App Gateway auth at the edge later. |
@@ -213,11 +215,33 @@ conversation ID, and is absent across `/new`. Input tokens grow every turn.
 | Observation | Evidence | Implication |
 |---|---|---|
 | **The gateway is the only way in, and the WAF blocks attacks** | Via gateway: normal `200`, SQLi `403`, XSS `403`, `<script>` in the chat JSON body `403`. Direct app URL `403`. Backend **Healthy** via `10.20.1.14`. | One inspected door. Attacks never reach the app or sign-in. |
-| **Sign-in works behind the proxy** | Entra `redirect_uri` = `https://chatbot-….cloudapp.azure.com/.auth/login/aad/callback` with `forwardProxy: Custom / X-Original-Host` | Without it, users land on the closed `azurewebsites.net` URL |
+| **Sign-in redirects to the gateway** | Entra `redirect_uri` = `https://chatbot-….cloudapp.azure.com/.auth/login/aad/callback` with `forwardProxy: Custom / X-Original-Host` | Without it, users land on the closed `azurewebsites.net` URL. **But a full sign-in wasn't tested in step 6b: the WAF blocked the callback** (see step 7b, experiment 39). |
 | **First gateway creation needs a reachable vault** | Private-only vault → `ApplicationGatewayKeyVaultSecretAccessDenied`, gateway Stopped (role, PE and DNS correct). Vault open → created. Then vault closed → update **succeeded**, still Running. | Not in the docs. Two-step bring-up (`allowKeyVaultSetup`). |
 | **I caused a lockout by closing the old door first** | The failed deploy had already set the main site to Deny → users got 403 until I reopened it (~minutes) | `closeDirectAppAccess`: open the new door, verify, then close the old one |
 | **App Gateway isn't a Key Vault trusted service** | Troubleshooting docs; we used a private endpoint instead | Don't rely on `bypass: AzureServices` for the gateway |
 | **NSGs applied without breaking anything** | After attaching: gateway → app Healthy, app → Foundry/Cosmos private OK, app egress 443 OK | Segmentation is now enforced. Endpoint policies are on, so the PE NSG applies. |
+
+**Step 7a (2026-11-19):**
+
+| Observation | Evidence | Implication |
+|---|---|---|
+| **A normal release** | staging build → restart → swap → production healthy, 4 min 20 s, production `200` throughout | Builds and cold starts no longer touch users |
+| **A broken build stays in staging** | Bad package in `requirements.txt`: status `3` after 19 s, no swap, production `200` | The step 6a outage (4.5 h) can't happen the same way again |
+| **App Service enforces the health gate** | `/healthz/deps` forced to 503: *"Cannot swap slots … application initialization … failed"*, production `200` | The check is part of the platform, not only our script, so it also protects a manual portal swap |
+| **Zones need quota** | `zoneRedundant: true` → *"Current Limit (P0v3 AZ App Service instances): 0"*. Scale unit supports 3 zones. | Plan quota before launch. Zones are a parameter, off by default. |
+| **Slots have their own identity** | The staging slot got its own system-assigned identity, so it needs its own Foundry User and Cosmos data roles | Identities don't swap. Forgetting this makes every swap fail the warm-up. |
+
+**Step 7b (2026-11-19):**
+
+| Observation | Evidence | Implication |
+|---|---|---|
+| **Inside vs outside** | Laptop + valid token → Search `403` *"publicNetworkAccess: Disabled"*. Jump box: Search → `10.20.1.9`, Foundry → `10.20.1.12`. | Operators go to the network; the services stay closed |
+| **Keyless SSH** | Signed in through Bastion as the Entra user, sudo from the VM login role, no key ever created, SSH passwords off | Access = role assignments, revocable and audited |
+| **Bastion enforces its NSG rules** | Narrower outbound rule rejected: `NetworkSecurityGroupNotCompliantForAzureBastionSubnet` | Use the documented rule set verbatim; narrow on the target subnet's NSG |
+| **Quota per VM family** | What-if: `B2als_v2`, `D2s_v5`, `D2as_v5` limit 0; `B2s` OK | Preflight before choosing sizes |
+| **First-boot race** | `Could not get lock /var/lib/dpkg/lock-frontend` (Entra extension installing at the same time), cloud-init still `done` | Retry in cloud-init; check results, not status |
+| **The WAF blocked sign-in** | Callback `/.auth/login/aad/callback` → gateway `403`: `state` (920230), `code` (942430, 942440), score 6–11 → 949110. Per-rule exclusions → `302`; SQLi elsewhere and inside `code` still `403`. | Tune a Prevention-mode WAF on real traffic; test the full user path, not one hop |
+| **Redeploys are safe** | Second deployment with a new random admin password: succeeded, same VM (`vmId` unchanged) | The `newGuid()` default is idempotent for VMs |
 
 Small samples on one model: treat these as observations, not guarantees.
 
@@ -230,8 +254,7 @@ Agent state now lives in resources you own (Cosmos DB, Storage, Search).
 Data services are reachable only from inside the VNet.
 Egress is default-deny with an auditable allow-list, ingress is one WAF-inspected entry point, and subnets
 are segmented. **Main adoption risks:** (1) no custom domain or CA certificate yet (browser warning, host name
-workaround); (2) operators have no private access path, and the SCM site is public (step 7: jump box/build
-agents); (3) single-zone, single-instance components (step 7); (4) on-server builds aren't atomic; (5) the
+workaround); (2) the SCM (deploy) site is public and deploys run from a laptop (no build agents in the VNet); (3) single-zone, single-instance components (zones are in the Bicep but need quota); (4) deploys run from a laptop, not CI; (5) the
 5-question eval; (6) firewall and gateway are switched off between sessions, so check which are deployed. **Next validation:** a larger eval set, and
 assignment via a security group rather than individual users.
 
@@ -243,7 +266,7 @@ assignment via a security group rather than individual users.
 - Self-signed certificate on a default `cloudapp` name; WAF in Prevention without tuning for false positives.
 - The firewall is Basic (no threat-intel deny, no DNS proxy) and can be switched off; when it's off, egress is unrestricted again.
 - Search → Foundry uses the trusted-services exception, not a private endpoint (needs Search S1+). No NSGs on subnets yet.
-- No private operator access: setup changes need `lockDown=false` temporarily (step 7 jump box/CI runner).
-- Single B1 instance, no zone redundancy (the diagram shows 3 zones).
+- Operator access is a shared jump box: fine for a few people, but repeatable changes belong in a CI runner inside the VNet. The jump box's egress (CLI, PyPI, GitHub) is broad, and its firewall rules weren't verified with the firewall on.
+- One P0v3 instance, no zone redundancy unless quota is granted (the diagram shows 3 zones). Deploys run from a laptop through the public, Entra-protected SCM site, not from build agents inside the VNet.
 - *Search Service Contributor* on the project MI is over-privileged. App Insights ingestion uses a connection string, not Entra.
 - The eval set is tiny and keyword-based.

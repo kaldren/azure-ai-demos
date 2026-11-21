@@ -8,18 +8,22 @@ on its own. Everything is defined in [`infra/main.bicep`](infra/main.bicep).
 - **How to run it and the experiments:** [README.md](README.md)
 - **Why each choice was made, and what we measured:** [STACK.md](STACK.md)
 
+> Built and verified step by step on 2026-11-15/19, then deleted. Everything here can be redeployed from the
+> Bicep; see the README's *Deploy* section.
+
 ## The picture
 
 ```mermaid
 flowchart LR
     user(["User<br/>browser"])
+    operator(["Operator<br/>az CLI"])
 
     subgraph vnet["Virtual network 10.20.0.0/16"]
         subgraph appgw["snet-appgw"]
             agw["Application Gateway<br/>+ WAF"]
         end
         subgraph appsvc["snet-appsvc"]
-            app["App Service<br/>chat UI + API"]
+            app["App Service<br/>chat UI + API<br/>(+ staging slot)"]
         end
         subgraph agent["snet-agent"]
             runtime["Agent runtime<br/>(network injection)"]
@@ -29,6 +33,12 @@ flowchart LR
         end
         subgraph fw["AzureFirewallSubnet"]
             firewall["Azure Firewall<br/>(egress allow-list)"]
+        end
+        subgraph bas["AzureBastionSubnet"]
+            bastion["Azure Bastion"]
+        end
+        subgraph jb["snet-jumpbox"]
+            jumpbox["Jump box VM<br/>(no public IP)"]
         end
     end
 
@@ -66,6 +76,9 @@ flowchart LR
     runtime -->|internet-bound traffic| firewall
     app -->|internet-bound traffic| firewall
     firewall -->|allow-listed only| internet
+    operator -->|"TLS + Entra sign-in"| bastion
+    bastion -->|SSH| jumpbox
+    jumpbox -->|"setup scripts"| pes
 ```
 
 Arrows into the data stores go through the private endpoints in `snet-pe`. Nothing in the
@@ -88,6 +101,20 @@ Arrows into the data stores go through the private endpoints in `snet-pe`. Nothi
    allows only listed destinations and logs every attempt.
 8. Both the app and Foundry send traces to **Application Insights**, so one request can be followed
    across all of these hops.
+
+## How a release ships (step 7a)
+
+```
+deploy_app.sh ──zip──▶ staging slot: pip install, restart          (users still on the old release)
+                              │
+             App Service calls /healthz/deps on staging ── not 200 ──▶ swap aborted, production untouched
+                              │ 200
+                              ▼
+                     swap: staging ⇄ production                     (previous release now in staging = rollback)
+```
+
+Both slots run on the same instances, use the same VNet path, and each has its **own managed identity**
+with the same roles, so the health check tests exactly what production will use.
 
 ## Two locks on every door
 
@@ -112,18 +139,32 @@ doesn't grant access without the right role.
 | Virtual network, private endpoints, private DNS zones | ✅ built | 5 |
 | Agent integration subnet (network injection) | ✅ built | 5 |
 | Azure Firewall + egress allow-list | ✅ built, **switched off between sessions** (cost) | 6a |
-| Application Gateway + WAF, Key Vault for the TLS certificate | ✅ built, can be switched off (cost) | 6b |
+| Application Gateway + WAF, Key Vault for the TLS certificate | ✅ built, can be switched off (cost). WAF tuned for the Entra sign-in callback. | 6b, 7b |
 | NSGs on subnets | ✅ built | 6b |
-| App Service across **3 availability zones** | ❌ single B1 instance | 7 |
-| **Azure Bastion + jump box** (private operator access) | ❌ not yet | 7 |
-| **Build agents** subnet (deploy from inside the network) | ❌ not yet. The SCM site stays public for deploys. | 7 |
-| **Storage for client app deployment** (run-from-package) | ❌ zip deploy with an on-server build instead | 7 |
+| App Service across **3 availability zones** | ⚠️ in the Bicep (`appServiceZoneRedundant`), off by default: needs zone quota the demo subscription doesn't have | 7a |
+| **Azure Bastion + jump box** (private operator access) | ✅ built: Bastion Standard, Entra ID SSH sign-in (no keys), VM without public IP | 7b |
+| **Build agents** subnet (deploy from inside the network) | ❌ not built. Deploys run from a laptop through the public (Entra-protected) SCM site. | — |
+| **Safe app deployment** (the diagram's run-from-package storage) | ✅ **staging slot + health-gated swap** instead. Run-from-package isn't supported for Python on App Service. | 7a |
 | **DDoS Protection** plan | ❌ not enabled (default infrastructure protection only) | 7 |
 | **Internet sources** (web search tool through the firewall) | ❌ no internet tool on the agent | — |
 | Custom domain + CA-issued certificate | ❌ self-signed certificate on the gateway's `cloudapp.azure.com` name | — |
 
-The remaining gaps are mostly about **operations and availability** (private admin access, zone
-redundancy, CI/CD inside the network), not about how a chat request flows.
+The remaining gaps are **CI/CD inside the network**, zone redundancy (quota), DDoS Protection, and a real
+domain and certificate. None of them changes how a chat request flows.
+
+## How people get in (step 7b)
+
+Users and operators take different doors. **Users** come through the Application Gateway and only reach
+the web app. **Operators** (who run `create_agent.py`, `ingest.py`, `evaluate.py`) come through **Bastion**
+to a **jump box** inside the VNet. From there the data services' normal hostnames resolve to private IPs.
+Nobody has to reopen public access (`lockDown=false`) to do setup work anymore.
+
+- **No SSH keys or passwords.** `az network bastion ssh --auth-type AAD` gets a short-lived certificate for
+  your Entra identity, and the VM checks your *Virtual Machine Administrator Login* role.
+- **No public port.** The VM has no public IP, and its NSG accepts SSH only from the Bastion subnet.
+- **Actions are yours, not the VM's.** You `az login` on the VM as yourself, and the VM's own identity has no
+  data roles, so stealing the VM doesn't give access to the data.
+- [`jumpbox.sh`](jumpbox.sh) wraps it: `ssh`, `sync` (copy the project), `run '<command>'`.
 
 ## Deviations from the baseline (on purpose)
 
@@ -136,6 +177,7 @@ redundancy, CI/CD inside the network), not about how a chat request flows.
 
 ## What it costs
 
-About **$135/month** for the always-on core (AI Search Basic, App Service B1, private endpoints), plus about
-**$0.40/hour** for the firewall and **$0.45/hour** for the Application Gateway while they're deployed.
+About **$190/month** for the always-on core (AI Search Basic, App Service P0v3, private endpoints; another ~$65/month per extra instance with zones), plus about
+**$0.40/hour** for the firewall, **$0.45/hour** for the Application Gateway, and **$0.33/hour** for Bastion + jump box
+while they're deployed.
 Prices are Sweden Central retail, checked 2026-11; see [STACK.md](STACK.md) and the README's *Cleanup* section.

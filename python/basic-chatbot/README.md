@@ -12,13 +12,16 @@
 - **Step 4b:** **"Your chats" sidebar**. The app keeps its *own* index of each user's conversations (title, timestamps) in a **separate** serverless Cosmos account, partitioned by user. Reopening a chat loads its messages through Foundry's API.
 - **Step 5:** **private networking**. A VNet with private endpoints and private DNS for Foundry, AI Search, both Cosmos DB accounts and Storage; the agent runs **inside** the VNet (network injection); the web app's outbound traffic goes through the VNet. **Public network access is disabled on everything except the web app.** This required a new Foundry resource; the step 1–4 one was deleted and purged.
 - **Step 6a:** **egress control**. Azure Firewall (Basic) with a route table on the agent and app subnets: internet-bound traffic must pass a **default-deny** allow-list, and every attempt is logged. It can be switched off between sessions (`deployFirewall=false`).
+- **Step 7a:** **safe deploys**. App Service moves to **Premium v3** with a **staging slot**: `deploy_app.sh` builds in staging, and App Service swaps it into production **only if `/healthz/deps` returns 200** (swap warm-up). Rollback is one more swap. **Zone redundancy** is in the Bicep (`appServiceZoneRedundant`), but it's off by default: new subscriptions have **0 quota** for zone-redundant instances.
+- **Step 7b:** **operator access**. **Azure Bastion** + a **jump box** VM inside the VNet: setup scripts run where the private endpoints are, with **Entra ID SSH sign-in** (no keys, no public IP on the VM), instead of reopening public access. [`jumpbox.sh`](jumpbox.sh) wraps it.
 - **Step 6b:** **ingress control**. **Application Gateway + WAF** is the only public entry point (TLS certificate in Key Vault); the web app's own URL denies direct traffic and the gateway reaches it through a private endpoint. **NSGs** segment every subnet.
 
 Why it's built this way, and what we observed: [STACK.md](STACK.md).
 
-> Status: steps 1–6b deployed and verified on 2026-11-15/19 (resource group `rg-basic-chatbot`, Sweden Central).
+> Status: steps 1–7b were built and verified on 2026-11-15/19 in Sweden Central, then **everything was deleted** (2026-11-19).
+> This folder is the reference: the Bicep, the code, and what we observed. To run it yourself, see [Deploy](#deploy).
 > Entry point: `https://<baseName>-<suffix>.<region>.cloudapp.azure.com` (Bicep output `appGatewayUrl`) (Application Gateway + WAF, **self-signed certificate: expect a browser warning**). The app's own `azurewebsites.net` URL returns 403. **Entra sign-in is required, and only assigned users get in.**
-> **Hourly billing while it exists:** AI Search Basic ~$0.11/h + App Service B1 ~$0.018/h. See [Cleanup](#cleanup).
+> **Hourly billing while it exists:** AI Search Basic ~$0.11/h + App Service P0v3 ~$0.089/h per instance (step 7a; B1 was ~$0.018/h). Bastion ~$0.29/h + jump box ~$0.043/h (step 7b). See [Cleanup](#cleanup).
 
 ## Azure resources
 
@@ -32,7 +35,8 @@ Defined in [`infra/main.bicep`](infra/main.bicep), region Sweden Central:
 | Azure AI Search, **Basic**, keyless, semantic ranker on the free plan | 2 | **~$0.11/hour** |
 | Project connection `search` (Entra auth) | 2 | none |
 | Log Analytics workspace + Application Insights, connected to Foundry (`appinsights`, `appinsights-project`) | 3 | per GB ingested (tiny) |
-| App Service plan **B1** Linux + web app (Python 3.14, system managed identity) | 3 | **~$0.018/hour** |
+| App Service plan Linux + web app (Python 3.14, system managed identity). **B1** in steps 3–6b | 3 | ~$0.018/hour |
+| Plan moved to **P0v3** + **staging slot** `staging` (own managed identity, same VNet integration, main site denied), swap warm-up on `/healthz/deps`. Optional `appServiceZoneRedundant=true` (≥2 instances, needs quota) | 7a | **~$0.089/hour per instance**; slots and zones add no charge |
 | User-assigned managed identity `id-chatbot-auth-…` (used only for sign-in) | 3b | none |
 | **Entra ID** app registration + federated credential + service principal (assignment required) + your assignment, created with the Microsoft Graph Bicep extension | 3b | none. **Not in the resource group**, see Cleanup |
 | App Service built-in authentication (`authsettingsV2`) | 3b | none |
@@ -50,6 +54,8 @@ Defined in [`infra/main.bicep`](infra/main.bicep), region Sweden Central:
 | **Key Vault** `kv-chatbot-…` (RBAC, private endpoint) holding the gateway's TLS certificate `agw-tls`; user-assigned identity for the gateway | 6b | ~free |
 | **Web app private endpoint** (`sites`) + DNS zones `privatelink.azurewebsites.net`, `privatelink.vaultcore.azure.net` | 6b | ~$15/month (2 endpoints) |
 | **NSGs** on `snet-agent`, `snet-pe` (private endpoint network policies enabled), `snet-appsvc`, `snet-appgw` | 6b | free |
+| **Azure Bastion Standard** `bas-chatbot-…` in `AzureBastionSubnet` (10.20.5.0/26) with native client support (tunneling), public IP, NSG with Bastion's required rules | 7b | **~$0.29/hour** |
+| **Jump box** `vm-jumpbox-…` (Ubuntu 24.04, `Standard_B2s`, no public IP) in `snet-jumpbox` (10.20.5.64/28), **Entra ID SSH login** (`AADSSHLoginForLinux`), az CLI + uv via cloud-init. NSG: SSH only from Bastion; out to private endpoints + web. You get *Virtual Machine Administrator Login*; the VM's identity gets no roles. | 7b | ~$0.043/hour + disk |
 
 Role assignments (all keyless):
 
@@ -75,8 +81,21 @@ Role assignments (all keyless):
 Only the **web app** is reachable from the internet. Foundry, Search, both Cosmos DB accounts and Storage
 refuse public calls, **even with a valid token** (403 / Forbidden). From your laptop, `create_agent.py`,
 `ingest.py`, `search.py`, `evaluate.py`, `inspect_cosmos.py`, `chat.py`, Data Explorer and the Foundry
-portal's agent pages no longer work. That's the point. Private developer access (Bastion + jump box) is step 7.
-To work from a laptop temporarily, redeploy with `-p lockDown=false`, then redeploy without it. `lockDown` **defaults to `true`**, so a plain redeploy never reopens public access by accident.
+portal's agent pages no longer work. That's the point.
+
+**Since step 7b, run them from the jump box** (a VM inside the VNet, reached through Azure Bastion, signed in with Entra ID):
+
+```bash
+az extension add -n bastion && az extension add -n ssh   # once, on your laptop
+./jumpbox.sh sync                     # copy this project (code, data, .env) to the VM
+./jumpbox.sh ssh                      # interactive shell on the VM, signed in as you
+#   on the VM, once:  az login --use-device-code
+#   then as usual:    cd basic-chatbot && uv run search.py "taxi at midnight"
+./jumpbox.sh run 'cd basic-chatbot && uv run evaluate.py'   # or one command at a time
+```
+
+The fallback (before step 7b, or with `deployBastion=false`): redeploy with `-p lockDown=false`, work from the laptop,
+then redeploy without it. `lockDown` **defaults to `true`**, so a plain redeploy never reopens public access by accident.
 
 Verify the private path and the firewall without signing in:
 
@@ -98,24 +117,56 @@ Firewall switches (Bicep parameters, all default to the safe value):
 | `deployAppGateway` | `true` | `false`: no gateway, app public again. Like the firewall, it doesn't delete an existing gateway. |
 | `closeDirectAppAccess` | `true` | `false` keeps the app's own URL open (use while bringing up or debugging the gateway) |
 | `allowKeyVaultSetup` | `false` | `true` opens Key Vault to the internet (still RBAC). Needed to **create the certificate** and for the gateway's **first creation**. |
+| `appServiceZoneRedundant` | `false` | `true` spreads the app over availability zones (≥2 instances, needs zone quota: experiment 34) |
+| `deployBastion` | `true` | Bastion + jump box. `false` doesn't delete existing ones (see Cleanup). |
+| `jumpboxVmSize` | `Standard_B2s` | VM quota is per family; preflight with what-if if this size has none (experiment 38) |
 
 ## Deploy
 
+From an empty subscription, in phases. Some resources can only be set up **before** everything is locked
+(the gateway's certificate, the search index, the first agent version), so the first deployment is open
+and the last one closes it. Each phase is something we hit while building; the full sequence below
+**hasn't been re-run end to end** in one go, so read the error message if a phase fails (Troubleshooting).
+
 ```bash
 az login
+az extension add -n bastion && az extension add -n ssh
 az group create -n rg-basic-chatbot -l swedencentral
-az deployment group create -g rg-basic-chatbot -f infra/main.bicep \
-  -p userPrincipalId=$(az ad signed-in-user show --query id -o tsv) lockDown=false \
-  --query properties.outputs
-# …create the agent, ingest, deploy the app and test (everything below), then lock down:
-az deployment group create -g rg-basic-chatbot -f infra/main.bicep \
-  -p userPrincipalId=$(az ad signed-in-user show --query id -o tsv) lockDown=true
-cp .env.example .env   # fill in FOUNDRY_PROJECT_ENDPOINT and SEARCH_ENDPOINT from the outputs
+UPN=$(az ad signed-in-user show --query id -o tsv)
+
+# 1. Build, open: public data plane, Key Vault reachable, no gateway yet (it needs a certificate first),
+#    firewall off (cheaper while you set up). ~25 min.
+az deployment group create -g rg-basic-chatbot -n build -f infra/main.bicep -p userPrincipalId=$UPN \
+  lockDown=false allowKeyVaultSetup=true deployAppGateway=false deployFirewall=false --query properties.outputs
+
+# 2. Data plane, from your laptop while it's open.
+cp .env.example .env    # fill in from the outputs: project endpoint, deployments, search endpoint/connection
 uv sync
+uv run ingest.py                                          # build the search index
+uv run create_agent.py --grounded --tool-choice required  # agent version 1 (the web app pins it)
+./deploy_app.sh                                           # staging slot → swap → health check
+
+# 3. The gateway's TLS certificate (self-signed, for the gateway's cloudapp.azure.com name).
+FQDN=$(az deployment group show -g rg-basic-chatbot -n build --query properties.outputs.appGatewayUrl.value -o tsv | sed 's|https://||')
+KV=$(az deployment group show -g rg-basic-chatbot -n build --query properties.outputs.keyVaultName.value -o tsv)
+az keyvault certificate create --vault-name $KV -n agw-tls --policy "$(az keyvault certificate get-default-policy \
+  | jq --arg cn "CN=$FQDN" --arg dns "$FQDN" '.x509CertificateProperties.subject=$cn
+      | .x509CertificateProperties.subjectAlternativeNames={dnsNames:[$dns]}')"
+
+# 4. First gateway creation: the vault must still be reachable, and keep the app's own URL open
+#    until the gateway works (experiment 29).
+az deployment group create -g rg-basic-chatbot -f infra/main.bicep -p userPrincipalId=$UPN \
+  lockDown=false allowKeyVaultSetup=true closeDirectAppAccess=false deployFirewall=false
+
+# 5. Lock everything (the defaults): data plane private, vault closed, app reachable only via the gateway,
+#    firewall on (~$0.40/h; add deployFirewall=false to skip it).
+az deployment group create -g rg-basic-chatbot -f infra/main.bicep -p userPrincipalId=$UPN
 ```
 
-Role assignments can take a few minutes to propagate. A 403, a `tool_user_error`, or `ingest.py`
-hanging at "Uploaded…" right after a deploy usually means: wait and retry.
+After phase 5, setup scripts run on the **jump box** (see *Access after step 5*), app deploys still run from your
+laptop with `./deploy_app.sh`, and you sign in at the `appGatewayUrl` output (self-signed certificate warning).
+Role assignments can take a few minutes to propagate: a 403, a `tool_user_error`, or `ingest.py` hanging at
+"Uploaded…" right after a deploy usually means wait and retry.
 
 ## Run
 
@@ -156,7 +207,7 @@ uv run inspect_cosmos.py conv_…             # the documents behind one convers
 
 # Step 3: the web app
 uv run --directory app python -m uvicorn main:app --port 8000 --env-file ../.env   # local, uses your az login
-./deploy_app.sh                        # zip-deploy app/ to App Service, wait for success + /healthz
+./deploy_app.sh                        # step 7a: build in the staging slot → swap (gated on /healthz/deps) → check production
 ```
 
 Locally there's no App Service in front, so there's no sign-in: the app acts as the user in
@@ -181,7 +232,8 @@ In the web UI each answer shows its searches, citations, agent version and token
 | [`app/main.py`](app/main.py) | FastAPI chat API: managed identity, OpenTelemetry | App Service (1→2) |
 | [`app/sessions.py`](app/sessions.py) | The app's own sessions index (Cosmos, partitioned by user) | app data |
 | [`app/static/index.html`](app/static/index.html) | Chat page. Holds the conversation ID in `sessionStorage`. | user |
-| [`deploy_app.sh`](deploy_app.sh) | Zip deploy; App Service runs `pip install` | build/deploy |
+| [`deploy_app.sh`](deploy_app.sh) | Safe deploy: staging slot build → warm-up-gated swap → production check | build/deploy |
+| [`jumpbox.sh`](jumpbox.sh) | `ssh` / `sync` / `run` on the jump box through Bastion, Entra sign-in | operator access |
 | [`inspect_cosmos.py`](inspect_cosmos.py) | Read-only view of agent state in our Cosmos DB | hop 7 (Cosmos DB) |
 | [`infra/bicepconfig.json`](infra/bicepconfig.json) | Pins the Microsoft Graph Bicep extension (Entra objects in IaC) | Entra ID |
 
@@ -342,7 +394,7 @@ In the web UI each answer shows its searches, citations, agent version and token
 
 **25. A blocked build took the app down (and nobody noticed)**
 - *Observe:* App Service platform metrics: from 09:23 to 13:53 almost every request was 5xx. The failed on-server build left the app unable to start until the next successful deploy.
-- *Explain:* zip deploy with an on-server build (`SCM_DO_BUILD_DURING_DEPLOYMENT`) isn't atomic. Fixes: deployment slots + swap (Standard tier or higher), building in CI and shipping a finished package, and a post-deploy health gate. `deploy_app.sh` now restarts the app and requires `/healthz/deps` to return 200.
+- *Explain:* zip deploy with an on-server build (`SCM_DO_BUILD_DURING_DEPLOYMENT`) isn't atomic. Fixes: deployment slots + swap (Standard tier or higher), building in CI and shipping a finished package, and a post-deploy health gate. **Step 7a fixes it with a staging slot** (experiments 31–33).
 
 **26. One public IP for everything that leaves**
 - *Observe:* all allowed egress from the agent and app subnets leaves from the firewall's public IP (`az network public-ip show -g rg-basic-chatbot -n pip-fw-<suffix> --query ipAddress`).
@@ -358,6 +410,7 @@ In the web UI each answer shows its searches, citations, agent version and token
 - *Predict:* the gateway sends `Host: app-….azurewebsites.net` to the app. Where does Entra send the user back after sign-in?
 - *Observe:* with `forwardProxy: Custom / X-Original-Host`, the `redirect_uri` sent to Entra is `https://chatbot-….cloudapp.azure.com/.auth/login/aad/callback` (the gateway's name).
 - *Explain:* without it, the user would be sent to the app's own URL, which now returns 403. Production fix: a custom domain on both gateway and app, so the host name never changes.
+- *Caveat:* this checked the redirect, not a completed sign-in. The first real sign-in through the gateway was **blocked by the WAF** on the way back (experiment 39).
 
 **29. The certificate chicken-and-egg (not in the docs)**
 - *Observe:* creating the gateway with Key Vault private-only failed: `ApplicationGatewayKeyVaultSecretAccessDenied`, gateway **Stopped**, although role, private endpoint and DNS were all correct. With the vault temporarily open it was created; afterwards **updates with the vault closed succeeded**.
@@ -365,6 +418,62 @@ In the web UI each answer shows its searches, citations, agent version and token
 
 **30. NSGs: segmentation inside the network**
 - *Explain:* the private endpoint subnet only accepts traffic from the agent, app and gateway subnets (everything else in the VNet is denied), the agent subnet accepts no inbound traffic at all, and agent/app outbound is limited to private endpoints + HTTPS. NSG rules only apply to private endpoints when the subnet's *private endpoint network policies* are enabled (off by default).
+
+### Step 7a
+
+The two failure tests use **throwaway copies** of the app, so the repo stays clean:
+`cp -r app deploy_app.sh` into a temp folder, break the copy, and run `./deploy_app.sh` from there.
+
+**31. A normal release goes through staging**
+- *Predict:* how long does a deploy take now, and does production go down during it?
+- *Change:* `./deploy_app.sh`
+- *Observe (2026-11-19):* `1/4 upload → 2/4 restart staging → 3/4 swap → 4/4 production healthy` in **4 min 20 s**. Production answered `200` throughout.
+- *Explain:* the build (Oryx `pip install`) and the cold start happen in **staging**, on the same instances, so users never hit a half-built app. The swap only switches routing, after App Service has called `/healthz/deps` on staging. Afterwards staging holds the **previous** release, so rolling back is `az webapp deployment slot swap -g rg-basic-chatbot -n <app> --slot staging`.
+
+**32. A broken build never reaches users (the step 6a outage, replayed)**
+- *Predict:* the 4.5-hour outage in experiment 25 started with a failed `pip install`. What happens now?
+- *Change:* in the copy, add `this-package-does-not-exist-7a==9.9.9` to `app/requirements.txt`, then deploy.
+- *Observe:* the staging build failed (deployment status `3` after 19 s) and the script stopped before the swap. Production via the gateway: `200`.
+- *Explain:* the failure stays in the slot no one uses. Compare experiment 25: same failure, but in place, so the live app broke.
+
+**33. The platform refuses an unhealthy release**
+- *Predict:* the build succeeds, but the new code can't reach its dependencies. Who stops it: the script or App Service?
+- *Change:* in the copy, make `/healthz/deps` in `app/main.py` always return `503`, then deploy.
+- *Observe:* build and restart succeeded, then the swap failed: *"Cannot swap slots … because the application initialization in 'staging' slot either took too long or failed"*. Production: `200`.
+- *Explain:* **App Service** aborted the swap, not our script. `WEBSITE_SWAP_WARMUP_PING_PATH=/healthz/deps` with `WEBSITE_SWAP_WARMUP_PING_STATUSES=200` makes the dependency check part of the platform's swap ([Learn](https://learn.microsoft.com/azure/app-service/deploy-staging-slots#specify-custom-warm-up)). Because the check runs inside staging, it tests staging's own identity and network path. That's why the slot has its **own** role assignments in the Bicep: managed identities don't swap.
+
+**34. Zone redundancy needs quota, not just a flag**
+- *Observe:* deploying with `appServiceZoneRedundant=true` failed: *"Current Limit (P0v3 AZ App Service instances): 0 … Amount required: 2"*. The plan's scale unit supports zones (`maximumNumberOfZones: 3`); the subscription doesn't have the quota.
+- *Explain:* availability is also a **capacity** question. Request quota (portal → Quotas → App Service) before a launch, not during an incident. The Bicep is ready; the default is `false` so the repo deploys on a fresh subscription.
+
+### Step 7b
+
+**35. Same name, two networks**
+- *Predict:* `srch-…search.windows.net` from your laptop and from the jump box: same IP? Same answer?
+- *Change:* on the laptop, `dig +short <host>` and call Search with a real token (`az account get-access-token --resource https://search.azure.com`); then `./jumpbox.sh run 'getent hosts <host>'`.
+- *Observe (2026-11-19):* laptop: public IP, and **403 even with a valid token**: *"The service is set 'publicNetworkAccess: Disabled'"*. Jump box: **10.20.1.9** (Search) and **10.20.1.12** (Foundry), the private endpoints.
+- *Explain:* the jump box isn't special. It's just inside the VNet, where the private DNS zones answer. Moving the operator inside the network replaces reopening the services (`lockDown=false`).
+
+**36. SSH with no keys and no passwords**
+- *Predict:* what user are you on the VM, and where does sudo come from?
+- *Change:* `./jumpbox.sh run 'whoami; sudo -n true && echo sudo'`
+- *Observe:* the user name is **your Entra sign-in name**, and sudo works. No key was ever created; the VM's SSH password login is off (cloud-init `ssh_pwauth: false`).
+- *Explain:* `az ssh` gets a short-lived SSH certificate for your identity, and the VM's `AADSSHLoginForLinux` extension checks your role (*Virtual Machine Administrator Login* = sudo; *User Login* = no sudo). Revoking access = removing a role assignment, not hunting for keys. *Try:* remove your role on the VM and connect again (expect a login failure), then redeploy to restore it.
+
+**37. Run the setup scripts from inside**
+- *Change:* `./jumpbox.sh sync`, then `./jumpbox.sh ssh`, and on the VM: `az login --use-device-code`, `cd basic-chatbot && uv run search.py "taxi at midnight"` (or `evaluate.py`).
+- *Observe:* the scripts work with `lockDown=true`, unchanged: same `.env`, same hostnames.
+- *Explain:* you signed in as **yourself** on the VM, so Foundry and Search see your identity and roles, not the VM's. The VM's own managed identity has **no** data roles. *Try (two locks, separately):* from the VM, get a token for its own identity (`curl -H Metadata:true 'http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://search.azure.com'`) and call Search with it. Expect an authorization error instead of the network error from experiment 35: inside the network, but without a role.
+
+**38. What the platform checks for you (four surprises)**
+- *Observe:* (1) **Bastion validates its subnet's NSG**: narrowing outbound SSH to the jump box subnet was rejected (`NetworkSecurityGroupNotCompliantForAzureBastionSubnet`); the documented rules are required as written. (2) **VM quota is per family**: preflight (what-if) failed for `B2als_v2`, `D2s_v5` and `D2as_v5` (limit 0) and passed for `B2s`. (3) **First-boot race**: the Azure CLI install failed on the package lock because the Entra login extension was installing at the same time; cloud-init still said `done`. (4) **customData is create-only**: fixing the first-boot script meant deleting and recreating the VM.
+- *Explain:* run what-if before deploying (it caught the quota problem before anything was created), check what cloud-init actually installed, not just its status, and keep jump boxes disposable: nothing on them that a redeploy can't recreate.
+
+**39. The WAF blocked the sign-in, after it succeeded**
+- *Observe (2026-11-19):* the first real sign-in through the gateway ended on the gateway's own `403 Forbidden` page at `/.auth/login/aad/callback`. The WAF log (`AGWFirewallLogs`) showed the sign-in response Entra posts back scoring 6–11: rule **920230** (*multiple URL encoding*) on the `state` field, **942430** (*too many special characters*) and **942440** (*SQL comment sequence*) on the `code` field, then the scoring rule **949110** blocked it. The same log also showed real internet scanners (Exchange exploit paths, PHP path traversal, Docker API) being caught.
+- *Change:* per-rule exclusions in the WAF policy: `state` values skip 920230, `code` values skip 942430/942440. Nothing else (Microsoft's guidance: only the matched fields, only the rules that fired, never the scoring rule).
+- *Observe after:* callback `403` → `302` (signed in). SQL injection in a URL: still `403`. SQL injection *inside a `code` field*: still `403` (other SQL injection rules still inspect it).
+- *Explain:* a WAF in Prevention mode needs tuning against **your** real traffic, and sign-in flows are a classic false positive. Step 6b had only checked that Entra redirected to the gateway, not that a sign-in completed: **test the whole user path**. Find the field and rule in the log (`found within [ARGS:<field>`), then exclude as narrowly as possible ([Learn](https://learn.microsoft.com/troubleshoot/azure/application-gateway/troubleshoot-waf-blocking-legitimate-requests-403)).
 
 ## Troubleshooting
 
@@ -386,12 +495,18 @@ In the web UI each answer shows its searches, citations, agent version and token
 - **The app's outbound traffic isn't routed through the VNet**: `siteConfig.vnetRouteAllEnabled` is silently ignored by `Microsoft.Web/sites@2024-11-01`. Use `properties.outboundVnetRouting.applicationTraffic: true` and check the deployed value.
 - **New app code deployed but the old code still answers**: the zip deploy succeeded, but the process wasn't restarted. Run `az webapp restart` and verify a new route.
 - **App Insights query returns nothing for older data**: `az monitor app-insights query` searches only the **last hour** unless you pass `--offset` (e.g. `--offset 2d`), whatever the query's `ago()` says.
+- **Gateway's own `403 Forbidden` page after signing in** (at `/.auth/login/aad/callback`): the WAF blocked Entra's response. Query `AGWFirewallLogs` for that URI and see experiment 39.
 - **Gateway fails with `ApplicationGatewayKeyVaultSecretAccessDenied` and is Stopped**: on FIRST creation the vault must be reachable: redeploy with `allowKeyVaultSetup=true closeDirectAppAccess=false`, then again with the defaults.
 - **Users get 403 everywhere**: the app's direct URL is closed but the gateway isn't working. Reopen it: `az resource update -g rg-basic-chatbot -n <webAppName> --resource-type Microsoft.Web/sites --set properties.siteConfig.ipSecurityRestrictionsDefaultAction=Allow`.
 - **Sign-in sends you to `azurewebsites.net` (403) after login**: `forwardProxy` isn't set to `Custom` + `X-Original-Host`, or the gateway callback URL is missing from the app registration.
 - **Browser warning on the gateway URL**: expected, because the certificate is self-signed. Use a custom domain + CA certificate for real users.
 - **App build fails with `SSL: UNEXPECTED_EOF_WHILE_READING` / `Could not fetch URL https://pypi.org…`**: the firewall blocks PyPI. Allow `pypi.org` + `files.pythonhosted.org` for `snet-appsvc` (done in Bicep), or build in CI.
-- **App returns 5xx after a failed deploy**: the on-server build broke the running app. Fix the cause and redeploy. `deploy_app.sh` now fails loudly if `/healthz/deps` isn't 200 after the deploy.
+- **App returns 5xx after a failed deploy**: since step 7a builds happen in the staging slot, so this shouldn't reach production. If it does, swap back: `az webapp deployment slot swap -g rg-basic-chatbot -n <app> --slot staging`.
+- **`Cannot swap slots … application initialization … failed`**: staging's `/healthz/deps` isn't 200 (experiment 33). Check staging's logs with `az webapp log tail … --slot staging`. A brand-new slot may need a few minutes for its role assignments to propagate.
+- **`./jumpbox.sh` says "Tunnel didn't open"**: Bastion may still be provisioning, the `bastion` CLI extension is missing, or port 2222 is in use (`PORT=2223 ./jumpbox.sh …`).
+- **Jump box login denied**: you need *Virtual Machine Administrator Login* (or *User Login*) on the VM. New role assignments can take a few minutes.
+- **`QuotaExceeded … Cores quota` on the jump box**: pick another size with `jumpboxVmSize` (experiment 38).
+- **`Operation cannot be completed without additional quota` (P0v3 AZ instances)**: zone redundancy needs quota (experiment 34). Deploy with `appServiceZoneRedundant=false`, or request quota.
 - **New route returns 404 after a successful deploy**: the old process kept running (seen twice). `deploy_app.sh` now restarts the app after every deployment.
 - **Firewall log tables (`AZFWApplicationRule`, `AZFWNetworkRule`) are empty**: the first rows take 10–20 minutes after enabling diagnostics. Use the firewall metrics (`ApplicationRuleHit`, `NetworkRuleHit`, split by `Status`) for near-real-time numbers.
 - **Redeploying silently reopened public access**: only possible before `lockDown` defaulted to `true`. Check with `az search service show … --query publicNetworkAccess`.
@@ -427,6 +542,15 @@ az network public-ip delete -g rg-basic-chatbot -n pip-agw-<suffix>
 
 While the firewall is off, **egress from the agent and app subnets is unrestricted**.
 
+Stop Bastion (~$0.29/h) and the jump box (~$0.043/h). Nothing depends on them, so no order:
+
+```bash
+az network bastion delete -g rg-basic-chatbot -n bas-chatbot-<suffix>
+az network public-ip delete -g rg-basic-chatbot -n pip-bastion-<suffix>
+az vm delete -g rg-basic-chatbot -n vm-jumpbox-<suffix> --yes   # also deletes its disk and NIC
+# Redeploys must then pass deployBastion=false, or they recreate both.
+```
+
 Stop the other hourly costs but keep Foundry (your agents and conversations):
 
 ```bash
@@ -435,18 +559,34 @@ az appservice plan delete -g rg-basic-chatbot -n <appServicePlanName> --yes   # 
 # Later: re-run the Bicep deployment, `uv run ingest.py`, and `./deploy_app.sh`.
 ```
 
-Remove everything:
+Remove everything (the order used for the final teardown on 2026-11-19):
 
 ```bash
-# A Foundry resource with projects can't be deleted directly ("nested resources exist"). Order:
-#   project capability host → projects → account (its capability host goes with it) → purge.
-# Delete AND purge a network-injected Foundry resource BEFORE deleting the VNet, or the agent
-# subnet stays locked by a service association link.
-az group delete -n rg-basic-chatbot --yes
-az cognitiveservices account purge -g rg-basic-chatbot -l swedencentral -n <foundryAccountName>
-# The Entra app registration lives in the tenant, not the resource group. Delete it separately:
+RG=rg-basic-chatbot
+ACC=$(az cognitiveservices account list -g $RG --query "[0].id" -o tsv)
+# 1–2. A Foundry resource with projects can't be deleted directly ("nested resources exist"):
+#      project capability host first, then the project (wait for each to disappear).
+az rest --method delete --url "$ACC/projects/proj-chatbot-std/capabilityHosts/agents?api-version=2025-06-01"
+az rest --method delete --url "$ACC/projects/proj-chatbot-std?api-version=2026-05-01"
+# 3. Account, then PURGE it. For a network-injected account, do this BEFORE deleting the VNet,
+#    or the agent subnet stays locked by a service association link.
+#    Observed 2026-11-19: the project looked gone (GET failed) but the account delete still said
+#    "nested resources exist". Retry the account delete until it succeeds. We didn't, so `az group delete`
+#    soft-deleted the account WITHOUT purging it, the subnet stayed locked (`legionservicelink`), and the
+#    VNet, NSGs and route table survived a 1-hour group delete. Fix: purge, wait for the subnet's
+#    serviceAssociationLinks to empty (a few minutes), delete the group again.
+az cognitiveservices account delete -g $RG -n <foundryAccountName>
+az cognitiveservices account purge -g $RG -l swedencentral -n <foundryAccountName>
+# 4. Everything else.
+az group delete -n $RG --yes
+# 5. Key Vault is soft-deleted (7 days here); purge it to free the name now.
+az keyvault purge -n <keyVaultName> -l swedencentral
+# 6. The Entra app registration lives in the tenant, not the resource group.
 az ad app delete --id $(az ad app list --filter "startswith(displayName,'Contoso Policy Chat')" --query "[0].appId" -o tsv)
 ```
+
+Left behind on purpose: `NetworkWatcherRG` (Azure creates it for VNets, free, possibly shared) and the
+`Microsoft.Quota` provider registration (free). On your laptop: `~/.ssh/known_hosts_jumpbox` (from `jumpbox.sh`).
 
 ## Notes / learnings
 

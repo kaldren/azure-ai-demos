@@ -10,11 +10,13 @@
 // Step 5, private networking: VNet, private endpoints + DNS, agent network injection, public access off.
 // Step 6a, egress control: Azure Firewall (Basic) + route table; only allow-listed destinations get out.
 // Step 6b, ingress control: Application Gateway + WAF as the only public entry; TLS cert in Key Vault.
+// Step 7a, availability + safe deploys: zone-redundant App Service (Premium v3) with a staging slot.
 //
 // We use the *basic* agent setup here, so conversation state is kept in Microsoft-managed
 // storage. Step 4 replaces it with your own Cosmos DB / Storage / AI Search ("standard setup").
 //
-// Deliberately NOT here yet: Bastion/jump box, build agents, zone redundancy (step 7).
+// Step 7b, operator access: Azure Bastion + a jump box VM, Entra ID sign-in only (no SSH keys, no public IP).
+// Deliberately NOT here yet: build agents inside the VNet.
 // Two layers now: identity (Entra ID + RBAC, no API keys) AND network (private endpoints).
 
 targetScope = 'resourceGroup'
@@ -65,6 +67,18 @@ param appGatewaySubnetPrefix string = '10.20.4.0/24' // Application Gateway v2: 
 
 @description('Step 6b. true: Application Gateway (WAF_v2, ~$0.45/h) is the only public entry; the web app main site denies direct public traffic. false: no gateway; the app is public again. Like the firewall, false does NOT delete an existing gateway.')
 param deployAppGateway bool = true
+
+// Step 7b: private access for people (operators), not for users.
+param bastionSubnetPrefix string = '10.20.5.0/26' // name fixed by Azure: AzureBastionSubnet, /26 minimum
+param jumpboxSubnetPrefix string = '10.20.5.64/28'
+@description('Step 7b. Azure Bastion (Standard, ~$0.29/h) + jump box VM (B2s ~$0.043/h). false stops NEW deployments only; delete them to stop billing (see README Cleanup).')
+param deployBastion bool = true
+@description('Jump box size. VM quota is per family and new subscriptions often have 0 for some (Basv2, DSv5, DASv5 were 0 here): preflight with what-if and pick one that passes.')
+param jumpboxVmSize string = 'Standard_B2s'
+param jumpboxAdminUsername string = 'azureadmin'
+@description('Local admin password nobody needs: SSH password login is disabled by cloud-init and people sign in with Entra ID. Random per deployment; VMs ignore password changes on redeploy.')
+@secure()
+param jumpboxAdminPassword string = newGuid()
 
 @description('Step 6b, one-off. true: open the Key Vault to the internet (still Entra + RBAC) so the TLS certificate can be created from a laptop. Default false: vault reachable only via its private endpoint.')
 param allowKeyVaultSetup bool = false
@@ -251,8 +265,15 @@ resource userSearchService 'Microsoft.Authorization/roleAssignments@2022-04-01' 
 @description('Agent version the web app pins to, in the standard-setup project (step 4). Version 1 there = grounded, tool_choice=required (same definition as v4 in the old basic project). See STACK.md.')
 param agentVersion string = '1'
 
-@description('App Service plan SKU. B1 is the cheapest tier that stays always-on enough for a demo (~$0.018/h Linux, Sweden Central).')
-param appServiceSku string = 'B1'
+@description('App Service plan SKU. Step 7a: Premium v3 is the cheapest tier with availability zones AND deployment slots. P0v3 = $0.089/h per instance (Linux, Sweden Central, 2026-11). Was B1 (~$0.018/h) before step 7a.')
+param appServiceSku string = 'P0v3'
+
+@description('Step 7a. Spread instances across availability zones. Needs Premium v2+, at least 2 instances, a zone-capable scale unit, AND quota: new subscriptions often have 0 "P0v3 AZ App Service instances" (deploy fails with "Operation cannot be completed without additional quota"). Request it in the portal (Quotas → App Service), or deploy with false: slots still work.')
+param appServiceZoneRedundant bool = false
+
+@description('Instances. Zone redundancy needs at least 2 (the baseline diagram shows 3): pass appServiceInstances=3 with appServiceZoneRedundant=true. Without zones, 1 is enough for slots.')
+@minValue(1)
+param appServiceInstances int = 1
 
 var webAppName = 'app-${baseName}-${suffix}'
 var monitoringRoles = {
@@ -325,10 +346,49 @@ resource plan 'Microsoft.Web/serverfarms@2024-11-01' = {
   kind: 'linux'
   sku: {
     name: appServiceSku
+    capacity: appServiceInstances
   }
   properties: {
     reserved: true // Linux
+    // Step 7a: instances are spread over availability zones (separate datacenters in the region), so one
+    // zone failing doesn't take the app down. No extra charge beyond the instances themselves. Possible
+    // in place because this plan's scale unit supports zones (properties.maximumNumberOfZones = 3).
+    zoneRedundant: appServiceZoneRedundant
   }
+}
+
+// Shared by the production site and the staging slot, so the two can't drift apart.
+var siteAppSettings = [
+  { name: 'SCM_DO_BUILD_DURING_DEPLOYMENT', value: 'true' } // pip install -r requirements.txt on deploy
+  // Step 4: the app now talks to the standard-setup project, where agent state lives in our Cosmos DB.
+  { name: 'FOUNDRY_PROJECT_ENDPOINT', value: 'https://${account.name}.services.ai.azure.com/api/projects/${stdProject.name}' }
+  { name: 'FOUNDRY_AGENT_NAME', value: 'basic-chatbot' }
+  { name: 'FOUNDRY_AGENT_VERSION', value: agentVersion }
+  { name: 'APPLICATIONINSIGHTS_CONNECTION_STRING', value: appInsights.properties.ConnectionString }
+  { name: 'OTEL_SERVICE_NAME', value: 'chat-web' }
+  // Step 3b: tells App Service authentication to use this managed identity's token as the
+  // client assertion instead of a client secret. The value is the MI's *client* ID.
+  { name: 'OVERRIDE_USE_MI_FIC_ASSERTION_CLIENTID', value: authIdentity.properties.clientId }
+  // Step 4b: the app's own data (sessions list), in a Cosmos account separate from Foundry's.
+  { name: 'APP_COSMOS_ENDPOINT', value: appCosmos.properties.documentEndpoint }
+  { name: 'APP_COSMOS_DATABASE', value: appCosmosDatabaseName }
+  // Step 7a: before a slot swap completes, App Service calls this path on the staging instances
+  // ("swap warm-up"). Any status other than 200 ABORTS the swap, so production never gets a build
+  // that can't reach Foundry and Cosmos DB.
+  { name: 'WEBSITE_SWAP_WARMUP_PING_PATH', value: '/healthz/deps' }
+  { name: 'WEBSITE_SWAP_WARMUP_PING_STATUSES', value: '200' }
+]
+
+var siteBaseConfig = {
+  scmIpSecurityRestrictionsUseMain: false
+  scmIpSecurityRestrictionsDefaultAction: 'Allow'
+  linuxFxVersion: 'PYTHON|3.14'
+  appCommandLine: 'gunicorn -w 2 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:8000 --timeout 180 main:app'
+  alwaysOn: true
+  minTlsVersion: '1.2'
+  ftpsState: 'Disabled'
+  healthCheckPath: '/healthz'
+  appSettings: siteAppSettings
 }
 
 // "App Service" box in the diagram. Still public, with no App Gateway in front. Step 6 adds that.
@@ -361,32 +421,43 @@ resource webApp 'Microsoft.Web/sites@2024-11-01' = {
     // users can only come in through the gateway (private endpoint traffic skips access restrictions),
     // while deploy_app.sh can still reach the SCM site from a laptop (Entra-authenticated).
     publicNetworkAccess: 'Enabled'
-    siteConfig: {
+    siteConfig: union(siteBaseConfig, {
       ipSecurityRestrictionsDefaultAction: deployAppGateway && closeDirectAppAccess ? 'Deny' : 'Allow'
-      scmIpSecurityRestrictionsUseMain: false
-      scmIpSecurityRestrictionsDefaultAction: 'Allow'
-      linuxFxVersion: 'PYTHON|3.14'
-      appCommandLine: 'gunicorn -w 2 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:8000 --timeout 180 main:app'
-      alwaysOn: true
-      minTlsVersion: '1.2'
-      ftpsState: 'Disabled'
-      healthCheckPath: '/healthz'
-      appSettings: [
-        { name: 'SCM_DO_BUILD_DURING_DEPLOYMENT', value: 'true' } // pip install -r requirements.txt on deploy
-        // Step 4: the app now talks to the standard-setup project, where agent state lives in our Cosmos DB.
-        { name: 'FOUNDRY_PROJECT_ENDPOINT', value: 'https://${account.name}.services.ai.azure.com/api/projects/${stdProject.name}' }
-        { name: 'FOUNDRY_AGENT_NAME', value: 'basic-chatbot' }
-        { name: 'FOUNDRY_AGENT_VERSION', value: agentVersion }
-        { name: 'APPLICATIONINSIGHTS_CONNECTION_STRING', value: appInsights.properties.ConnectionString }
-        { name: 'OTEL_SERVICE_NAME', value: 'chat-web' }
-        // Step 3b: tells App Service authentication to use this managed identity's token as the
-        // client assertion instead of a client secret. The value is the MI's *client* ID.
-        { name: 'OVERRIDE_USE_MI_FIC_ASSERTION_CLIENTID', value: authIdentity.properties.clientId }
-        // Step 4b: the app's own data (sessions list), in a Cosmos account separate from Foundry's.
-        { name: 'APP_COSMOS_ENDPOINT', value: appCosmos.properties.documentEndpoint }
-        { name: 'APP_COSMOS_DATABASE', value: appCosmosDatabaseName }
-      ]
-    }
+    })
+  }
+}
+
+// Step 7a: the staging slot. A second copy of the app on the same instances, with its own host name and
+// its own system-assigned identity. deploy_app.sh deploys HERE, then swaps (warm-up gated) into production.
+// Never publicly reachable: main site denies all traffic, and swap warm-up runs inside the platform.
+resource stagingSlot 'Microsoft.Web/sites/slots@2024-11-01' = {
+  parent: webApp
+  name: 'staging'
+  location: location
+  kind: 'app,linux'
+  identity: {
+    type: 'SystemAssigned' // its own principal: it needs the same roles as production (below)
+  }
+  properties: {
+    serverFarmId: plan.id
+    httpsOnly: true
+    virtualNetworkSubnetId: vnet::appServiceSubnet.id // same outbound path as production
+    outboundVnetRouting: { applicationTraffic: true }
+    publicNetworkAccess: 'Enabled' // SCM (deploy) reachable; main site denied below
+    siteConfig: union(siteBaseConfig, {
+      ipSecurityRestrictionsDefaultAction: 'Deny'
+    })
+  }
+}
+
+// Identities don't move with a swap, so the staging identity needs what the code needs: Foundry + app Cosmos.
+resource stagingFoundryUser 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  scope: account
+  name: guid(account.id, stagingSlot.id, foundryUserRoleId)
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', foundryUserRoleId)
+    principalId: stagingSlot.identity.principalId
+    principalType: 'ServicePrincipal'
   }
 }
 
@@ -734,6 +805,17 @@ resource userSessionsData 'Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignme
   dependsOn: [webAppSessionsData] // Cosmos role assignments must not run in parallel
 }
 
+resource stagingSessionsData 'Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignments@2025-04-15' = {
+  parent: appCosmos
+  name: guid(appCosmos.id, stagingSlot.id, stdRoles.cosmosDataContributor)
+  properties: {
+    principalId: stagingSlot.identity.principalId
+    roleDefinitionId: '${appCosmos.id}/sqlRoleDefinitions/${stdRoles.cosmosDataContributor}'
+    scope: '${appCosmos.id}/dbs/${appCosmosDatabaseName}'
+  }
+  dependsOn: [userSessionsData] // Cosmos role assignments must not run in parallel
+}
+
 // ---------------------------------------------------------------------------------------------
 // Step 6b: ingress control (diagram ①: Application Gateway + WAF, Key Vault for its certificate)
 // Docs: https://learn.microsoft.com/azure/app-service/overview-app-gateway-integration
@@ -819,6 +901,38 @@ resource wafPolicy 'Microsoft.Network/ApplicationGatewayWebApplicationFirewallPo
     managedRules: {
       managedRuleSets: [
         { ruleSetType: 'Microsoft_DefaultRuleSet', ruleSetVersion: '2.1' } // Microsoft's OWASP-based rules
+      ]
+      // False positives on the Entra ID sign-in callback (/.auth/login/aad/callback), found in the WAF log
+      // 2026-11-19: Entra posts back `state` (URL-encoded redirect) and `code` (long opaque string), which
+      // scored 6–11 and got blocked (949110) AFTER a successful sign-in. Per Microsoft's guidance: exclude
+      // only the matched field VALUES, only from the rules that fired, never the scoring rule. Everything
+      // else in these requests (and these fields for all other rules) is still inspected.
+      // Docs: https://learn.microsoft.com/troubleshoot/azure/application-gateway/troubleshoot-waf-blocking-legitimate-requests-403
+      exclusions: [
+        {
+          matchVariable: 'RequestArgValues'
+          selectorMatchOperator: 'Equals'
+          selector: 'state'
+          exclusionManagedRuleSets: [
+            {
+              ruleSetType: 'Microsoft_DefaultRuleSet'
+              ruleSetVersion: '2.1'
+              ruleGroups: [{ ruleGroupName: 'PROTOCOL-ENFORCEMENT', rules: [{ ruleId: '920230' }] }] // multiple URL encoding
+            }
+          ]
+        }
+        {
+          matchVariable: 'RequestArgValues'
+          selectorMatchOperator: 'Equals'
+          selector: 'code'
+          exclusionManagedRuleSets: [
+            {
+              ruleSetType: 'Microsoft_DefaultRuleSet'
+              ruleSetVersion: '2.1'
+              ruleGroups: [{ ruleGroupName: 'SQLI', rules: [{ ruleId: '942430' }, { ruleId: '942440' }] }] // special chars, "--"
+            }
+          ]
+        }
       ]
     }
   }
@@ -1096,7 +1210,11 @@ resource nsgPrivateEndpoints 'Microsoft.Network/networkSecurityGroups@2024-05-01
         properties: { priority: 120, direction: 'Inbound', access: 'Allow', protocol: 'Tcp', sourceAddressPrefix: appGatewaySubnetPrefix, sourcePortRange: '*', destinationAddressPrefix: privateEndpointSubnetPrefix, destinationPortRange: '443' }
       }
       {
-        name: 'DenyOtherVNetInbound' // e.g. a future jump box subnet needs an explicit rule (step 7)
+        name: 'AllowFromJumpbox' // step 7b: operators run create_agent.py, ingest.py, evaluate.py from here
+        properties: { priority: 130, direction: 'Inbound', access: 'Allow', protocol: 'Tcp', sourceAddressPrefix: jumpboxSubnetPrefix, sourcePortRange: '*', destinationAddressPrefix: privateEndpointSubnetPrefix, destinationPortRange: '443' }
+      }
+      {
+        name: 'DenyOtherVNetInbound' // anything else in the VNet needs an explicit rule above
         properties: { priority: 4000, direction: 'Inbound', access: 'Deny', protocol: '*', sourceAddressPrefix: 'VirtualNetwork', sourcePortRange: '*', destinationAddressPrefix: '*', destinationPortRange: '*' }
       }
     ]
@@ -1119,6 +1237,57 @@ resource nsgAppGateway 'Microsoft.Network/networkSecurityGroups@2024-05-01' = {
       {
         name: 'AllowAzureLoadBalancer' // required (health of the gateway instances)
         properties: { priority: 120, direction: 'Inbound', access: 'Allow', protocol: '*', sourceAddressPrefix: 'AzureLoadBalancer', sourcePortRange: '*', destinationAddressPrefix: '*', destinationPortRange: '*' }
+      }
+    ]
+  }
+}
+
+// Step 7b: Bastion requires ALL of these rules if its subnet has an NSG (else no platform updates/sessions).
+// Source: https://learn.microsoft.com/azure/bastion/bastion-nsg
+resource nsgBastion 'Microsoft.Network/networkSecurityGroups@2024-05-01' = {
+  name: 'nsg-bastion-${suffix}'
+  location: location
+  properties: {
+    securityRules: [
+      { name: 'AllowHttpsInbound', properties: { priority: 120, direction: 'Inbound', access: 'Allow', protocol: 'Tcp', sourceAddressPrefix: 'Internet', sourcePortRange: '*', destinationAddressPrefix: '*', destinationPortRange: '443' } }
+      { name: 'AllowGatewayManagerInbound', properties: { priority: 130, direction: 'Inbound', access: 'Allow', protocol: 'Tcp', sourceAddressPrefix: 'GatewayManager', sourcePortRange: '*', destinationAddressPrefix: '*', destinationPortRange: '443' } }
+      { name: 'AllowAzureLoadBalancerInbound', properties: { priority: 140, direction: 'Inbound', access: 'Allow', protocol: 'Tcp', sourceAddressPrefix: 'AzureLoadBalancer', sourcePortRange: '*', destinationAddressPrefix: '*', destinationPortRange: '443' } }
+      { name: 'AllowBastionHostCommunication', properties: { priority: 150, direction: 'Inbound', access: 'Allow', protocol: '*', sourceAddressPrefix: 'VirtualNetwork', sourcePortRange: '*', destinationAddressPrefix: 'VirtualNetwork', destinationPortRanges: ['8080', '5701'] } }
+      // Exactly as documented: Azure VALIDATES this rule set, and narrowing the destination to the jump box
+      // subnet was rejected ("NetworkSecurityGroupNotCompliantForAzureBastionSubnet", 2026-11-19).
+      // The jump box's own NSG does the narrowing instead (SSH only from this subnet).
+      { name: 'AllowSshRdpOutbound', properties: { priority: 100, direction: 'Outbound', access: 'Allow', protocol: '*', sourceAddressPrefix: '*', sourcePortRange: '*', destinationAddressPrefix: 'VirtualNetwork', destinationPortRanges: ['22', '3389'] } }
+      { name: 'AllowAzureCloudOutbound', properties: { priority: 110, direction: 'Outbound', access: 'Allow', protocol: 'Tcp', sourceAddressPrefix: '*', sourcePortRange: '*', destinationAddressPrefix: 'AzureCloud', destinationPortRange: '443' } }
+      { name: 'AllowBastionCommunication', properties: { priority: 120, direction: 'Outbound', access: 'Allow', protocol: '*', sourceAddressPrefix: 'VirtualNetwork', sourcePortRange: '*', destinationAddressPrefix: 'VirtualNetwork', destinationPortRanges: ['8080', '5701'] } }
+      { name: 'AllowHttpOutbound', properties: { priority: 130, direction: 'Outbound', access: 'Allow', protocol: '*', sourceAddressPrefix: '*', sourcePortRange: '*', destinationAddressPrefix: 'Internet', destinationPortRange: '80' } }
+    ]
+  }
+}
+
+resource nsgJumpbox 'Microsoft.Network/networkSecurityGroups@2024-05-01' = {
+  name: 'nsg-jumpbox-${suffix}'
+  location: location
+  properties: {
+    securityRules: [
+      {
+        name: 'AllowSshFromBastion' // the ONLY way in: no public IP, and only Bastion's subnet may open port 22
+        properties: { priority: 100, direction: 'Inbound', access: 'Allow', protocol: 'Tcp', sourceAddressPrefix: bastionSubnetPrefix, sourcePortRange: '*', destinationAddressPrefix: jumpboxSubnetPrefix, destinationPortRange: '22' }
+      }
+      {
+        name: 'DenyAllInbound'
+        properties: { priority: 4000, direction: 'Inbound', access: 'Deny', protocol: '*', sourceAddressPrefix: '*', sourcePortRange: '*', destinationAddressPrefix: '*', destinationPortRange: '*' }
+      }
+      {
+        name: 'AllowPrivateEndpoints' // Foundry, Search, Cosmos DB, Storage, Key Vault: all HTTPS
+        properties: { priority: 100, direction: 'Outbound', access: 'Allow', protocol: 'Tcp', sourceAddressPrefix: jumpboxSubnetPrefix, sourcePortRange: '*', destinationAddressPrefix: privateEndpointSubnetPrefix, destinationPortRange: '443' }
+      }
+      {
+        name: 'AllowWebInternet' // tools: az CLI + Azure Resource Manager, Entra ID, uv/PyPI (443), Ubuntu packages (80)
+        properties: { priority: 110, direction: 'Outbound', access: 'Allow', protocol: 'Tcp', sourceAddressPrefix: jumpboxSubnetPrefix, sourcePortRange: '*', destinationAddressPrefix: 'Internet', destinationPortRanges: ['80', '443'] }
+      }
+      {
+        name: 'DenyAllOutbound' // e.g. the jump box can't reach the agent or app subnets
+        properties: { priority: 4000, direction: 'Outbound', access: 'Deny', protocol: '*', sourceAddressPrefix: '*', sourcePortRange: '*', destinationAddressPrefix: '*', destinationPortRange: '*' }
       }
     ]
   }
@@ -1182,6 +1351,24 @@ resource vnet 'Microsoft.Network/virtualNetworks@2024-05-01' = {
           networkSecurityGroup: { id: nsgAppGateway.id }
         }
       }
+      {
+        // "Azure Bastion subnet" (step 7b): the managed SSH/RDP broker lives here.
+        name: 'AzureBastionSubnet' // exact name required by Azure Bastion
+        properties: {
+          addressPrefix: bastionSubnetPrefix
+          networkSecurityGroup: { id: nsgBastion.id }
+        }
+      }
+      {
+        // "Jump box subnet" (step 7b): an operator VM inside the network, reachable only through Bastion.
+        name: 'snet-jumpbox'
+        properties: {
+          addressPrefix: jumpboxSubnetPrefix
+          defaultOutboundAccess: true // fallback path when the firewall is off (like the other workload subnets)
+          routeTable: { id: egressRoutes.id }
+          networkSecurityGroup: { id: nsgJumpbox.id }
+        }
+      }
     ]
   }
 
@@ -1191,6 +1378,8 @@ resource vnet 'Microsoft.Network/virtualNetworks@2024-05-01' = {
   resource firewallSubnet 'subnets' existing = { name: 'AzureFirewallSubnet' }
   resource firewallManagementSubnet 'subnets' existing = { name: 'AzureFirewallManagementSubnet' }
   resource appGatewaySubnet 'subnets' existing = { name: 'snet-appgw' }
+  resource bastionSubnet 'subnets' existing = { name: 'AzureBastionSubnet' }
+  resource jumpboxSubnet 'subnets' existing = { name: 'snet-jumpbox' }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1262,7 +1451,7 @@ resource firewallPolicy 'Microsoft.Network/firewallPolicies@2024-05-01' = if (de
               name: 'entra-id'
               description: 'Agent runtime and app authenticate with Microsoft Entra ID (docs: AzureActiveDirectory service tag).'
               ipProtocols: ['TCP']
-              sourceAddresses: [agentSubnetPrefix, appServiceSubnetPrefix]
+              sourceAddresses: [agentSubnetPrefix, appServiceSubnetPrefix, jumpboxSubnetPrefix]
               destinationAddresses: ['AzureActiveDirectory']
               destinationPorts: ['443']
             }
@@ -1321,6 +1510,30 @@ resource firewallPolicy 'Microsoft.Network/firewallPolicies@2024-05-01' = if (de
               sourceAddresses: [appServiceSubnetPrefix]
               protocols: [{ protocolType: 'Https', port: 443 }]
               targetFqdns: ['pypi.org', 'files.pythonhosted.org']
+            }
+            {
+              ruleType: 'ApplicationRule'
+              name: 'jumpbox-tools'
+              // Step 7b. An operator box needs far more egress than a workload: that's a reason to keep it
+              // separate and switch it off. NOT yet verified with the firewall on (it was off during step 7b).
+              description: 'Jump box: Entra SSH login (packages, pas.windows.net), az CLI + ARM, uv/Python packages.'
+              sourceAddresses: [jumpboxSubnetPrefix]
+              protocols: [{ protocolType: 'Https', port: 443 }, { protocolType: 'Http', port: 80 }]
+              targetFqdns: [
+                entraLoginHost
+                '*.login.microsoft.com'
+                'pas.windows.net'
+                'packages.microsoft.com'
+                'aka.ms'
+                'azurecliprod.blob.${environment().suffixes.storage}'
+                replace(replace(environment().resourceManager, 'https://', ''), '/', '')
+                '*.ubuntu.com'
+                'astral.sh'
+                'github.com'
+                '*.githubusercontent.com'
+                'pypi.org'
+                'files.pythonhosted.org'
+              ]
             }
           ]
         }
@@ -1468,6 +1681,123 @@ resource privateEndpointDns 'Microsoft.Network/privateEndpoints/privateDnsZoneGr
   }
 ]
 
+// ---------------------------------------------------------------------------------------------
+// Step 7b: operator access (the "Azure Bastion" and "Jump box" boxes in the diagram)
+// People who run setup scripts (create_agent.py, ingest.py, evaluate.py) sign in to a VM INSIDE the
+// network through Bastion, instead of reopening public access with lockDown=false. Nothing has a public
+// SSH port: Bastion has the only public IP, and it's a TLS endpoint that requires Azure sign-in + RBAC.
+// ---------------------------------------------------------------------------------------------
+
+var vmRoles = {
+  administratorLogin: '1c0163c0-47e6-4577-8991-ea5c82e286e4' // Entra SSH login with sudo
+}
+
+resource bastionPublicIp 'Microsoft.Network/publicIPAddresses@2024-05-01' = if (deployBastion) {
+  name: 'pip-bastion-${suffix}'
+  location: location
+  sku: { name: 'Standard' }
+  properties: { publicIPAllocationMethod: 'Static' }
+}
+
+// Standard, not Basic: native client support (az network bastion ssh/tunnel from a terminal, Entra sign-in,
+// file copy over the tunnel). Basic = browser sessions only. Developer (free) = no Entra sign-in.
+resource bastion 'Microsoft.Network/bastionHosts@2024-05-01' = if (deployBastion) {
+  name: 'bas-${baseName}-${suffix}'
+  location: location
+  sku: { name: 'Standard' }
+  properties: {
+    enableTunneling: true // "native client support"
+    ipConfigurations: [
+      {
+        name: 'ipconfig'
+        properties: {
+          subnet: { id: vnet::bastionSubnet.id }
+          publicIPAddress: { id: bastionPublicIp.id }
+        }
+      }
+    ]
+  }
+}
+
+resource jumpboxNic 'Microsoft.Network/networkInterfaces@2024-05-01' = if (deployBastion) {
+  name: 'nic-jumpbox-${suffix}'
+  location: location
+  properties: {
+    ipConfigurations: [
+      {
+        name: 'ipconfig'
+        properties: {
+          subnet: { id: vnet::jumpboxSubnet.id }
+          privateIPAllocationMethod: 'Dynamic' // private only: no public IP on the VM
+        }
+      }
+    ]
+  }
+}
+
+// First boot: no SSH passwords, then the tools the setup scripts need. People sign in as THEMSELVES
+// (`az login` on the VM), so actions are audited per person and the VM itself has no data roles.
+var jumpboxCloudInit = '''#cloud-config
+ssh_pwauth: false
+package_update: true
+packages: [git, jq, unzip]
+runcmd:
+  # Retry: on first boot the Entra login extension runs apt at the same time, and the CLI installer
+  # failed on the dpkg lock (observed 2026-11-19: "Could not get lock /var/lib/dpkg/lock-frontend").
+  - for i in $(seq 1 20); do curl -sL https://aka.ms/InstallAzureCLIDeb | bash && break; sleep 15; done
+  - curl -LsSf https://astral.sh/uv/install.sh | env UV_UNMANAGED_INSTALL=/usr/local/bin sh
+'''
+// customData only runs at creation and can't be changed afterwards: to change it, delete the VM and redeploy.
+
+resource jumpbox 'Microsoft.Compute/virtualMachines@2024-07-01' = if (deployBastion) {
+  name: 'vm-jumpbox-${suffix}'
+  location: location
+  identity: { type: 'SystemAssigned' } // required by the Entra login extension; NO roles assigned to it
+  properties: {
+    hardwareProfile: { vmSize: jumpboxVmSize }
+    osProfile: {
+      computerName: 'jumpbox'
+      adminUsername: jumpboxAdminUsername
+      adminPassword: jumpboxAdminPassword
+      customData: base64(jumpboxCloudInit)
+      linuxConfiguration: { disablePasswordAuthentication: false } // ARM needs one method; cloud-init turns SSH passwords off
+    }
+    storageProfile: {
+      imageReference: { publisher: 'Canonical', offer: 'ubuntu-24_04-lts', sku: 'server', version: 'latest' }
+      osDisk: { createOption: 'FromImage', deleteOption: 'Delete', managedDisk: { storageAccountType: 'StandardSSD_LRS' } }
+    }
+    networkProfile: {
+      networkInterfaces: [{ id: jumpboxNic.id, properties: { deleteOption: 'Delete' } }]
+    }
+    securityProfile: { securityType: 'TrustedLaunch', uefiSettings: { secureBootEnabled: true, vTpmEnabled: true } }
+  }
+}
+
+// Lets Entra ID users sign in with SSH (short-lived certificates instead of keys).
+// Docs: https://learn.microsoft.com/entra/identity/devices/howto-vm-sign-in-azure-ad-linux
+resource jumpboxEntraLogin 'Microsoft.Compute/virtualMachines/extensions@2024-07-01' = if (deployBastion) {
+  parent: jumpbox
+  name: 'AADSSHLoginForLinux'
+  location: location
+  properties: {
+    publisher: 'Microsoft.Azure.ActiveDirectory'
+    type: 'AADSSHLoginForLinux'
+    typeHandlerVersion: '1.0'
+    autoUpgradeMinorVersion: true
+  }
+}
+
+// Who may sign in to the jump box at all (here: you). Without this role, Bastion connects but login fails.
+resource jumpboxLogin 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (deployBastion) {
+  scope: jumpbox
+  name: guid(jumpbox.id, userPrincipalId, vmRoles.administratorLogin)
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', vmRoles.administratorLogin)
+    principalId: userPrincipalId
+    principalType: 'User'
+  }
+}
+
 output foundryAccountName string = account.name
 output modelDeploymentName string = modelDeployment.name
 output embeddingDeploymentName string = embeddingDeployment.name
@@ -1486,3 +1816,5 @@ output firewallDeployed bool = deployFirewall
 output firewallPrivateIp string = firewallPrivateIp
 output appGatewayUrl string = 'https://${appGatewayFqdn}'
 output keyVaultName string = keyVault.name
+output bastionName string = deployBastion ? bastion.name : ''
+output jumpboxId string = deployBastion ? jumpbox.id : ''
